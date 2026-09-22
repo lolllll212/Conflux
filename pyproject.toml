@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conflux"
+version = "0.7.3"
+description = "Deterministic, lock-free state management for concurrent AI agents (CRDT / lattice protocol)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+crypto = ["cryptography>=3.4"]
+test = ["pytest", "cryptography>=3.4"]
+
+[tool.setuptools]
+packages = ["conflux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
