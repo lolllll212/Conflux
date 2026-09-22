@@ -28,7 +28,8 @@ Conflux is a **small-crew deterministic state fabric** for a few dozen agents
 of a single application: signed, replayable, eventually-consistent shared
 agent state with durable journaling and crash recovery. The protocol is
 specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md); every claim in it maps to
-a test (conformance index at the end of the spec).
+a test (conformance index at the end of the spec). Conflux is released under
+the [MIT License](LICENSE).
 
 Scope — what it is:
 
@@ -436,3 +437,8 @@ framing beyond TLS, multi-cluster federation, chunked cross-peer snapshot
 exchange, OpenTelemetry exporters, and workflow orchestration expansion. Each
 is a candidate to revisit only after the core fabric — determinism, durability,
 crash recovery — is proven by adopters.
+
+## License
+
+Conflux is released under the [MIT License](LICENSE), as declared in
+`pyproject.toml`.
