@@ -28,7 +28,10 @@ Conflux is a **small-crew deterministic state fabric** for a few dozen agents
 of a single application: signed, replayable, eventually-consistent shared
 agent state with durable journaling and crash recovery. The protocol is
 specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md); every claim in it maps to
-a test (conformance index at the end of the spec).
+a test (conformance index at the end of the spec). The signing, identity, and
+storage subsystems are reviewed in [`docs/SECURITY.md`](docs/SECURITY.md),
+which also states the trust boundary and the open findings. Conflux is
+released under the [MIT License](LICENSE).
 
 Scope — what it is:
 
@@ -180,7 +183,12 @@ Actions travel as envelopes that any node can verify before they touch state.
 
 A server equipped with a registry refuses unverified, unauthorized, or
 quota-exhausted submits (`{"type": "error", "reason": "..."}`); a server without
-one still schema-validates but runs in trust-less dev mode.
+one still schema-validates but runs in trust-less dev mode. Note that the
+registry guards the agent `submit` path only — the peer gossip path is trusted
+at the network layer, and every node's listen port must therefore be treated
+as a peer-trusted boundary. [`docs/SECURITY.md`](docs/SECURITY.md) walks
+through what the signing, identity, and storage layers do and do not
+guarantee, with each property mapped to the code and tests that enforce it.
 
 ```python
 from conflux import AgentRegistry, Client, Server
@@ -436,3 +444,18 @@ framing beyond TLS, multi-cluster federation, chunked cross-peer snapshot
 exchange, OpenTelemetry exporters, and workflow orchestration expansion. Each
 is a candidate to revisit only after the core fabric — determinism, durability,
 crash recovery — is proven by adopters.
+
+## Security
+
+The cryptographic signing, identity verification, and storage subsystems are
+documented in [`docs/SECURITY.md`](docs/SECURITY.md): threat model and trust
+boundary, the properties the implementation enforces (constant-time
+verification, algorithm binding, canonical serialization, signer binding,
+replay idempotence, keyless-reload refusal), the findings that remain open,
+and a deployment checklist. To report a vulnerability, open a GitHub issue or
+contact the maintainer privately as described there.
+
+## License
+
+Conflux is released under the [MIT License](LICENSE), as declared in
+`pyproject.toml`.
