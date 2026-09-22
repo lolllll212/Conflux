@@ -78,11 +78,11 @@ def test_partition_reconnect(tls_files):
                tls=tls_files[:2], stale_after=0.6).start()
     b = Server("b", ("127.0.0.1", 0), gossip_interval=0.05,
                tls=tls_files[:2], stale_after=0.6).start()
-    c = Server("c", ("127.0.0.1", 0), gossip_interval=0.05, auto_discover=True,
+    c = Server("c", ("127.0.0.1", 0), peers=[b.node_address], gossip_interval=0.05,
                tls=tls_files[:2], stale_after=0.6).start()
     a.add_peer(b.node_address)
-    b.add_peer(c.node_address)
     client = None
+    b2 = None
     try:
         with Client("127.0.0.1", a.node_address[1], agent_id="c", tls=tls_files[2]) as cl:
             client = cl
@@ -98,7 +98,7 @@ def test_partition_reconnect(tls_files):
             cl.counter_inc("orders", 2)
             assert _converge(a, "orders", 3)
 
-            b2 = Server("b", b.node_address, gossip_interval=0.05,
+            b2 = Server("b", b.node_address, peers=[c.node_address], gossip_interval=0.05,
                         tls=tls_files[:2], stale_after=0.6).start()
             a.add_peer(b2.node_address)
             assert _converge(b2, "orders", 3)
@@ -108,11 +108,12 @@ def test_partition_reconnect(tls_files):
         if client is not None:
             client.close()
         a.stop()
-        for s in (b, c):
-            try:
-                s.stop()
-            except (AttributeError, OSError):
-                pass
+        for s in (b, b2, c):
+            if s is not None:
+                try:
+                    s.stop()
+                except (AttributeError, OSError):
+                    pass
 
 
 def test_signed_journal_tamper(tmp_path):

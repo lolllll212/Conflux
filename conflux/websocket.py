@@ -235,6 +235,14 @@ class WebSocketServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def server_bind(self):
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
     def __init__(self, host, port, on_ws, ssl_ctx=None):
         self.on_ws = on_ws
         super().__init__((host, port), _WSHandler)

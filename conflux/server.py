@@ -63,6 +63,11 @@ class Server:
         if self.transport == "tcp":
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
             sock.bind(self.address)
             sock.listen(32)
             if self._tls is not None and self._tls.server_ready:
@@ -101,10 +106,18 @@ class Server:
             except OSError:
                 pass
         if self._socket is not None:
+            addr = self.node_address
             try:
                 self._socket.close()
             except OSError:
                 pass
+            if addr and self.transport == "tcp":
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as wake_sock:
+                        wake_sock.settimeout(0.1)
+                        wake_sock.connect(addr)
+                except OSError:
+                    pass
         if self._ws_server is not None:
             try:
                 self._ws_server.shutdown()
@@ -238,6 +251,12 @@ class Server:
             try:
                 conn, _ = self._socket.accept()
             except OSError:
+                break
+            if self._stopped.is_set():
+                try:
+                    conn.close()
+                except OSError:
+                    pass
                 break
             threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
 
