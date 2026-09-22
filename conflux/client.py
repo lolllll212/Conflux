@@ -74,6 +74,36 @@ class Client:
     def _next_tag(self):
         return f"{self.agent_id}:{self.replica.timestamp() + 1}"
 
+    def submit_batch(self, op_specs):
+        """Submit multiple operations in a single atomic network round-trip.
+
+        Each spec is a tuple of (op, key, params).
+        """
+        if not op_specs:
+            return []
+        actions = [self.replica._emit(op, key, params) for op, key, params in op_specs]
+        if self.secret is not None:
+            payload = {"type": "submit",
+                       "actions": [sign_action(a, self.secret, self.signature_alg) for a in actions]}
+        else:
+            payload = {"type": "submit", "actions": [a.export() for a in actions]}
+        self._send(payload)
+        resp = self._recv_safe()
+        if not resp or resp.get("type") == "error":
+            raise ConnectionError(resp.get("reason", "submit rejected") if resp else "submit rejected")
+        if resp.get("type") != "ack":
+            raise ConnectionError("server did not acknowledge submit")
+        return actions
+
+    def batch(self):
+        """Context manager to batch multiple mutations into a single network frame:
+
+            with client.batch() as b:
+                b.counter_inc("orders", 1)
+                b.register_set("status", "ready")
+        """
+        return _ClientBatch(self)
+
     def _submit(self, op, key, params):
         action = self.replica._emit(op, key, params)
         if self.secret is not None:
@@ -129,4 +159,49 @@ class Client:
 
     def __exit__(self, *exc):
         self.close()
+        return False
+
+
+class _ClientBatch:
+    def __init__(self, client):
+        self._client = client
+        self._specs = []
+        self.actions = []
+
+    def counter_inc(self, key, by=1):
+        self._specs.append(("counter_inc", key, {"by": by}))
+        return self
+
+    def counter_dec(self, key, by=1):
+        self._specs.append(("counter_dec", key, {"by": by}))
+        return self
+
+    def register_set(self, key, value):
+        self._specs.append(("lww_set", key, {"value": value}))
+        return self
+
+    def register_set_weighted(self, key, value, weight):
+        self._specs.append(("lww_set", key, {"value": value, "weight": weight}))
+        return self
+
+    def set_add(self, key, value, tag=None):
+        tag = tag or self._client._next_tag()
+        self._specs.append(("orset_add", key, {"value": value, "tag": tag}))
+        return self
+
+    def set_add_weighted(self, key, value, weight, tag=None):
+        tag = tag or self._client._next_tag()
+        self._specs.append(("orset_add", key, {"value": value, "weight": weight, "tag": tag}))
+        return self
+
+    def set_remove(self, key, tag):
+        self._specs.append(("orset_remove", key, {"tag": tag}))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None and self._specs:
+            self.actions = self._client.submit_batch(self._specs)
         return False
