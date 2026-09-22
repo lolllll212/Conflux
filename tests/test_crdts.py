@@ -77,6 +77,15 @@ def test_orset_merge_conflicting_tag_is_deterministic():
     assert b.merge(a).read() == frozenset({"high"})
 
 
+def test_orset_compact():
+    s = ORSet({"t1": "a", "t2": "b"}, frozenset()).remove("t1")
+    assert s.read() == frozenset({"b"})
+    compacted = s.compact()
+    assert compacted.read() == frozenset({"b"})
+    assert compacted.elements == {"t2": "b"}
+    assert compacted.tombstones == frozenset()
+
+
 def test_ormap_laws():
     a = ORMap({"x": GCounter({"a": 1})})
     b = ORMap({"y": PNCounter({"b": (1, 1)}), "x": GCounter({"a": 3})})

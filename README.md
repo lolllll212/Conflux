@@ -366,6 +366,12 @@ client.register_set("flight.eta", "14:05")
 client.set_add("tickets", "TK-100", tag="tk-100")
 print(client.read("bookings.seats"))          # 2
 print(client.hash())                          # 64-hex SHA-256 of canonical state
+
+# Batch multiple mutations in a single atomic round-trip:
+with client.batch() as b:
+    b.counter_inc("bookings.seats", 1)
+    b.register_set("flight.status", "boarding")
+
 client.close()
 ```
 

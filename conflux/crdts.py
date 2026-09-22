@@ -190,6 +190,11 @@ class ORSet(Lattice):
             tag for tag in self.elements if tag not in self.tombstones
         )
 
+    def compact(self):
+        """Return a compacted ORSet where tombstoned tags and their associated elements are pruned."""
+        active = {t: v for t, v in self.elements.items() if t not in self.tombstones}
+        return ORSet(active, frozenset())
+
     def canonical(self):
         elems = sorted(
             ((t, _canonical_value(v)) for t, v in self.elements.items()), key=repr

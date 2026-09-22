@@ -113,3 +113,19 @@ def test_sync_pulls_journal_to_client():
             assert reader.replica.read("k") == "v1"
     finally:
         server.stop()
+
+
+def test_client_batch_submit():
+    server = Server("n1", ("127.0.0.1", 0))
+    server.start()
+    try:
+        with Client("127.0.0.1", server.node_address[1], agent_id="batcher") as client:
+            with client.batch() as b:
+                b.counter_inc("batch_orders", 10)
+                b.register_set("batch_status", "in_progress")
+                b.set_add("batch_items", "item1", tag="it-1")
+            assert client.read("batch_orders") == 10
+            assert client.read("batch_status") == "in_progress"
+            assert client.read("batch_items") == ["item1"]
+    finally:
+        server.stop()
