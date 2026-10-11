@@ -131,9 +131,33 @@ namespace, or quota fails are rejected before any state mutation.
 - **TLS**: both transports wrap sockets with the stdlib `ssl` module when
   `--cert/--key` (or `Server(tls=...)`) is configured; peers/clients verify
   against the provided CA or system CAs.
+- **A frame is decoded only once it has been bounded.** The 4-byte length is
+  checked against `max_frame` *before* any read; the payload must be valid
+  UTF-8, then JSON, then a JSON *object*; a run of 64 or more openers is
+  refused without handing it to the decoder (the C scanner recurses per level,
+  and `RecursionError` was the one failure that escaped every
+  `except ValueError` in the process); a payload that stops early is
+  `truncated`, which is a different event from a clean close and is reported
+  as one. Every refusal is `ProtocolError`, a `ValueError` subclass, so the
+  existing "drop this peer" handling still catches it. Reads go through
+  `recv_into`, so a frame costs its size rather than a quadratic number of
+  copies.
+- **One writer per connection.** A link's outbound queue is drained by its own
+  thread while the reader on the same connection answers `hello_ack`, `sync` and
+  journal requests; both go through one per-connection lock, because two
+  interleaved `sendall` calls produce a stream whose next length prefix belongs
+  to the other frame — corruption that looks like a malformed peer.
+- **Outbound is refused on the same terms.** `send_msg(..., max_frame=)`
+  raises `FrameTooLarge` *instead of writing* a frame the peer is
+  contractually free to reject, and `dumps_frame` raises the same type for a
+  payload that is not JSON-serialisable. A node that cannot fit its journal
+  into one frame chunks it (§6.3) rather than shipping something a peer will
+  hang up on.
 
-**Claim H3.** Framing round-trips and rejects overlong/malformed frames.
-— `tests/test_websocket.py`, `tests/test_phase4.py::test_tls_convergence`
+**Claim H3.** Framing round-trips; refuses overlong, non-UTF-8, non-object,
+over-deep and truncated frames; and refuses to *send* a frame a peer may
+reject. — `tests/test_websocket.py`, `tests/test_phase4.py::test_tls_convergence`,
+`tests/test_fault_transport.py`
 
 ### 6.2 Messages (agent)
 
@@ -165,12 +189,66 @@ namespace, or quota fails are rejected before any state mutation.
   peer can never freeze the gossip loop for the rest of the mesh; when a queue
   is full, further frames are dropped and re-sent next round (safe because the
   receiver dedups by `action_id` and the join is idempotent).
+- **A cursor, not a set of ids**: each link remembers how far into the journal
+  it has delivered (`metrics()["link_cursors"]`) plus the highest `through` it
+  was acked — two integers. Keeping "every id sent" and "every id queued" per
+  link grew with the journal and was walked on every round; with a cursor the
+  round costs what it delivered, so a node at 20 000 actions and one at 500
+  differ by nothing. Delivery stays at-least-once, which is safe for exactly
+  the reason above.
+- **Chunked to fit**: gossip pushes and `sync` replies are built under a byte
+  budget (`frame_batch_bytes`, clamped to `max_frame`) and an action count
+  (`batch_size`), so a node whose journal is longer than one frame is still
+  joinable. If a *single* action is larger than `max_frame` there is nothing to
+  chunk: the node says so in `metrics()["oversize_frames"]` and the reply
+  names the knob, instead of letting the peer silently refuse it.
+- **Supervised**: a gossip round that raises is logged, counted
+  (`gossip_errors`) and retried after `min(gossip_interval × 2**min(failures, 5), 30)`
+  seconds; the loop outlives it. Every link a connection registered is dropped
+  in that connection's `finally`, including links that never got an address —
+  an idle reaper that keyed on `address` used to miss exactly those, so each
+  failed handshake cost a thread and a link entry for the life of the process.
+- **Idle links heartbeat, and that is also anti-entropy**: when a link has
+  nothing to deliver, the round puts one small frame on it —
+  `{"type": "heartbeat", "node_id": …, "hash": <state_hash>, "journal": N}` — with
+  the hash computed **once per round**, not once per link. Two things follow. A
+  link that is alive but caught up is no longer reaped as idle and re-dialled
+  forever, so a converged mesh is quiet instead of churning threads and log
+  lines every `stale_after`; and a node that *silently missed* delivery — a frame
+  dropped by backpressure, a link registered mid-rotation — is noticed, because
+  the peer's state root is not its own. On a mismatch the receiver enqueues
+  `{"type": "resync"}` and the sender resets that link's cursor to 0 and resends:
+  at-least-once plus `action_id` dedup means a needless resend costs bandwidth
+  and nothing else. One outstanding resync per link (`metrics()["resyncs"]` counts
+  them) is what stops a pair that is already converging from stampeding each other
+  with full journal pushes. Cost: one frame per idle link per `gossip_interval`
+  (default 1 s), so a 12-node mesh carries ~11 small frames/s/node.
+- **Bounded on the way in**: inbound links are capped at `max_connections`;
+  past the cap a socket is accepted and closed at once and
+  `rejected_connections` is counted, so the cost of a connection flood is a
+  counter an operator can alert on, not a thread table. One inbound frame may
+  ask for at most `max_actions_per_frame` actions — "valid JSON" and
+  "affordable to absorb" are separate questions. An agent that over-subscribes
+  gets `{"type": "error", "reason": "… split it"}` and keeps its connection; a
+  peer link is dropped.
 
 **Claim H4.** Two peers converge to one `state_hash`; a partitioned and healed
 peer re-converges without operator action. — `tests/test_server.py`,
 `tests/test_phase4.py::test_partition_reconnect`
 **Claim H7.** A stalled peer doesn't block other links; reconnect re-sends do
 not double-apply (`action_id` dedup). — `tests/test_prod_hardening.py`
+**Claim H8.** A node whose journal exceeds one frame is joinable, and a
+steady-state gossip round does not cost more as the journal grows. On the dev
+box, with `max_frame=8192` and a 4 KiB chunk budget, a peer converged on a
+500-action journal in 0.06 s and on a 20 000-action journal in 0.99 s, both
+with `oversize_frames=0`, and a round measured 0.003 ms and 0.002 ms
+respectively. — `tests/test_fault_transport.py` (joinability, cursor
+semantics), `benchmarks/bench.py` (round cost on the target host)
+**Claim H9.** A mesh of converged, idle nodes stays quiet instead of churning: a
+link survives every staleness window because it carries its own state root, a node
+whose root disagrees with its peer's is repaired by a resend from the journal's
+start, a peer that stops speaking is still reaped, and a read taken during a
+snapshot rotation is never torn. — `tests/test_fault_transport.py`
 
 ### 6.4 Admin
 
@@ -188,7 +266,15 @@ computable and the crashed replica able to rejoin exactly.
 | ------------------------------ | -------- |
 | Node crash mid-write           | fsync'd append means no acknowledged action is lost; an unacknowledged torn tail is skipped on load (§7) |
 | Silent tamper vs. corruption   | signature mismatch on any verifiable line raises on load; nothing is silently replayed |
-| Invalid/unframed/invalid-JSON message | peer link closed; re-dial per liveness rules |
+| Invalid/unframed/invalid-JSON message | peer link closed, `malformed_frames` counted; re-dial per liveness rules |
+| Oversize, non-UTF-8, non-object, over-deep or truncated frame | refused before decode; counted, dropped, no traceback from the worker thread |
+| One frame asking for more actions than `max_actions_per_frame` | refused before anything is absorbed: agent answered and kept, peer link dropped; `oversize_frames` counted |
+| More inbound links than `max_connections` | accepted and closed immediately, `rejected_connections` counted; established links keep serving |
+| Gossip round raises on one link | that link dropped and re-dialled, `gossip_errors` counted and logged; the loop continues |
+| Link alive but idle (nothing to deliver) | heartbeats its state root each round instead of being reaped; a peer that stops heartbeating is still dropped after `stale_after` |
+| State roots drift (a delivery was lost, or a join raced a rotation) | the heartbeat mismatch asks that peer to resend from journal index 0; convergence returns without an operator, and the request is counted (`resyncs`) |
+| Two reply paths write one connection | one per-connection write lock; frames cannot interleave into a stream the peer reads as garbage |
+| Journal longer than one frame | gossip and `sync` are chunked to the byte budget; a joiner converges instead of being cut off |
 | Unverified / unauthorized submit | refused with `{"type":"error"}`; no state mutation (§5) |
 | Peer down / partition          | other peers keep converging; stale link dropped after `stale_after`, re-dialed with backoff; reconcile-on-reconnect restores convergence without operator action |
 | Clock skew between agents      | convergence does not depend on wall-clock time anywhere in the state machine; receipt mismatch can delay session messages but not merge correctness |
@@ -268,6 +354,15 @@ rotations. — `tests/test_phase4.py::test_cumulative_compaction`
 | dial / recv timeouts | 3 s connect, 10 s socket read |
 | per-link outbound queue | bounded at 256 messages; overflow dropped, re-sent next round |
 | listen backlog | 32 |
+| frame cap, both directions | `max_frame` = 64 MiB (`--max-frame`); inbound length is checked before the read, outbound before the write |
+| inbound links held open | `max_connections` = 64 per process; beyond it, accept-then-close |
+| gossip / `sync` chunk budget | `frame_batch_bytes` = 1 MiB, clamped to `max_frame` (`--frame-bytes`) |
+| actions per inbound frame | `max_actions_per_frame` = 100 000 (`--max-actions-per-frame`) |
+| JSON nesting | decoder depth 128; a run of ≥ 64 openers is refused before decoding |
+| per-link send state | journal cursor + highest acked `through` (two integers, no growth with the journal) |
+| idle-link traffic | one heartbeat frame per link per `gossip_interval`, sent only when the link has nothing to deliver; one `state_hash` computed per round |
+| resync rate | one outstanding resend request per link, cleared when it is caught up |
+| outbound queue per link | 256 frames, backpressure by dropping the frame and leaving the cursor where it was |
 | quota | `None` = unlimited; charged once per **validated submit envelope** (redelivery of an already-applied `action_id` counts again); enforcement is atomic under concurrent submits |
 | TLS | stdlib `ssl`; server cert required to enable, peer/client CA verification |
 | determinism clock | none — no wall clock in merge, hashing, or decisions |
@@ -311,4 +406,7 @@ rotations. — `tests/test_phase4.py::test_cumulative_compaction`
 | D7| whole-node kill -9 and mid-rotation restart | `tests/test_prod_hardening.py`        |
 | D8| signed log refuses reload without key; server refuses corrupt start | `tests/test_spec_conformance.py` |
 | H6| no self-dial, peer-journal validation, client timeout surface | `tests/test_prod_hardening.py` |
+| H7| a stalled peer cannot block the mesh; re-sends do not double-apply | `tests/test_prod_hardening.py` |
+| H8| unusable frames are counted and survived; work per frame and per connection is bounded; a long journal stays joinable | `tests/test_fault_transport.py` |
+| H9| an idle link is not churned; a lost delivery heals itself from the heartbeat hash; a dead peer is still reaped; reads are never torn by rotation | `tests/test_fault_transport.py` |
 | H7| async per-link sends + dial workers; stalled peer can't block gossip; reconnect dedup | `tests/test_prod_hardening.py`, `tests/test_websocket.py` |

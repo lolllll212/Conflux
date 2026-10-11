@@ -3,6 +3,47 @@ import ssl
 import struct
 
 MAX_FRAME = 64 * 1024 * 1024
+# A frame's nesting depth, not its size, is what kills a json decoder: the C
+# scanner recurses per level and raises RecursionError part way through. Conflux
+# frames are flat objects of flat actions, so 128 is generous for real traffic
+# and far below the point where the decoder starts failing.
+MAX_DEPTH = 128
+_DEEP_RUN = max(24, min(64, MAX_DEPTH // 2))
+
+
+class ProtocolError(ValueError):
+    """A frame this node will not accept: oversized, truncated, or not a JSON object.
+
+    Subclasses ``ValueError`` deliberately - every caller already treats a bad
+    frame as "drop this peer" by catching ValueError, and an unclassified
+    ``RecursionError`` from the decoder is what used to escape that net and print
+    a traceback from a worker thread.
+    """
+
+
+class FrameTooLarge(ProtocolError):
+    """The payload exceeds the frame cap, so the *sender* must chunk it."""
+
+
+def _reject_nesting(raw):
+    """Cheap pre-scan: only pathological input has long runs of openers."""
+    if b"[" * _DEEP_RUN in raw or b"{" * _DEEP_RUN in raw:
+        raise ProtocolError(f"frame nests more than {_DEEP_RUN} levels deep; "
+                            f"refusing to decode it")
+
+
+def dumps_frame(obj, *, max_frame=MAX_FRAME):
+    """Serialise a frame, refusing one the peer is contractually allowed to reject."""
+    try:
+        payload = json.dumps(obj).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(f"message is not serialisable: {exc}") from exc
+    if max_frame and len(payload) > max_frame:
+        raise FrameTooLarge(f"frame is {len(payload)} bytes, over the {max_frame} byte cap; "
+                            f"split the payload (batch_size/frame_batch_bytes)")
+    return payload
+
+
 
 
 class TLSConfig:
@@ -53,32 +94,70 @@ def normalize_tls(tls, server_side=False):
     raise TypeError(f"cannot interpret tls config {tls!r}")
 
 
-def send_msg(sock, obj):
-    payload = json.dumps(obj).encode("utf-8")
+def send_msg(sock, obj, *, max_frame=MAX_FRAME):
+    """Write one length-prefixed frame. Returns the payload size.
+
+    The size is checked *before* anything is written: a frame the peer would reject
+    on the floor used to be written anyway, so the link closed with no clue on this
+    side and the caller retried the same oversize payload forever.
+    """
+    payload = dumps_frame(obj, max_frame=max_frame)
     sock.sendall(struct.pack(">I", len(payload)) + payload)
+    return len(payload)
 
 
-def recv_msg(sock):
+def recv_msg(sock, *, max_frame=MAX_FRAME):
+    """Read one frame into a dict, or raise ProtocolError. ``None`` means EOF."""
     header = _recv_exact(sock, 4)
     if header is None:
         return None
     (length,) = struct.unpack(">I", header)
-    if length == 0 or length > MAX_FRAME:
-        raise ValueError(f"invalid frame length {length}")
+    if length == 0 or length > max_frame:
+        raise ProtocolError(f"invalid frame length {length} (cap {max_frame})")
     body = _recv_exact(sock, length)
     if body is None:
-        return None
-    return json.loads(body.decode("utf-8"))
+        raise ProtocolError(f"peer closed after {len(header)}/1+{length} bytes: truncated frame")
+    _reject_nesting(body)
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(f"frame is not valid utf-8: {exc}") from exc
+    try:
+        msg = json.loads(text)
+    except RecursionError as exc:
+        raise ProtocolError(f"frame nests too deeply to decode: {exc}") from exc
+    except ValueError as exc:
+        raise ProtocolError(f"frame is not JSON: {exc}") from exc
+    if not isinstance(msg, dict):
+        raise ProtocolError(f"frame must be a JSON object, got {type(msg).__name__}")
+    return msg
 
 
 def _recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
+    """Read exactly ``n`` bytes into one buffer.
+
+    ``buf += chunk`` over a 64 MB frame is quadratic and keeps every partial copy
+    alive, which turns a slow or dribbling peer into a memory amplifier; a fixed
+    bytearray read into in place costs what the frame costs.
+    """
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        try:
+            count = sock.recv_into(view[got:], n - got)
+        except AttributeError:  # a socket-like without recv_into (test doubles)
+            chunk = sock.recv(n - got)
+            if not chunk:
+                return None
+            count = len(chunk)
+            buf[got:got + count] = chunk
+        if not count:
             return None
-        buf += chunk
-    return buf
+        got += count
+    return bytes(buf)
+
+
 
 
 def to_wire(value):

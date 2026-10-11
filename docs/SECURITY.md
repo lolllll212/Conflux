@@ -319,9 +319,62 @@ independent per entry — there is no hash chain — so deletion, truncation,
 or reordering of whole lines is not detected (F3). Reordering is harmless
 (the join is order-independent, C4); deletion is a rollback.
 
+### S7 — Fail-clean framing: an unusable frame costs a connection, never a node
+
+**Property.** Every inbound frame passes a sequence of checks before any
+handler sees it, and every check produces the same class of outcome:
+`conflux.net.ProtocolError` (a `ValueError`, so the pre-existing "drop this
+peer" handling applies), a log line naming the peer and the reason, and
+`metrics()["malformed_frames"] += 1`. The checks are: payload length against
+`max_frame` (before the read, so an advertised 4 GiB length costs four bytes),
+decodable UTF-8, valid JSON, a JSON object, a nesting run below 64 openers,
+and a complete payload. A frame that is *well-formed but hostile in shape* —
+`{"type":"journal","actions": 5}`, an action with a key too many, a `read`
+with no `key` — is answered or refused the same way, never raised out of a
+worker thread.
+
+**Why it matters here.** The pre-0.7.4 behavior for a deeply nested frame was
+`RecursionError`, which no `except ValueError` catches: the traceback printed
+from a thread with no owner, the link entry and its sender thread leaked, and
+the operator learned about it from log noise. That is the failure mode this
+property closes; it is *availability* hardening, not an authentication claim
+(F1 is unaffected and still open).
+
+**Evidence.** `tests/test_fault_transport.py` — the six refusal classes, the
+EOF-versus-truncated distinction, the leak-free drop, the counted hostile
+peer, the answered malformed submit.
+
+### S8 — Bounded work per frame, per connection, per round
+
+**Property.** Three caps, all CLI-exposed and all in `metrics()`:
+`max_connections` (64) bounds how many links an unauthenticated peer can open
+and hold; `max_actions_per_frame` (100 000) bounds what one frame can ask the
+receiver to absorb; `frame_batch_bytes` (1 MiB, clamped by `max_frame`) bounds
+what the *sender* emits, which is what makes a long journal joinable instead
+of oversized and refused. Per-link send state is a journal cursor plus an ack,
+so a round costs what it delivered. A round that raises is counted
+(`gossip_errors`) and retried with backoff rather than ending the loop.
+
+**Also in this property.** Frames on one connection are written under a
+per-connection lock, so a reply from the reader thread cannot interleave with the
+link's queued pushes — an unauthenticated party does not need to corrupt a peer,
+it only needs to make the *node* write its own stream badly. And liveness traffic
+is real traffic: an idle link heartbeats its state root once per gossip round,
+which is what lets an idle-but-live link survive the staleness reaper while a hung
+one still dies, and lets two peers notice a hash mismatch and repair it with a
+bounded resend (one outstanding resync per link).
+
+**Residual.** These caps bound cost; they do not authenticate. Under F1 a
+peer inside the trust boundary can still write arbitrary actions — up to the
+caps, forever, one frame at a time. Do not read S8 as a fix for F1.
+
+**Evidence.** `tests/test_fault_transport.py` (`max_connections` flood, the
+over-long frame both directions, the flat cursor cost), `tests/test_prometheus.py`.
+
 ## 5. Open findings
 
-Severity reflects impact under the trust boundary of §2.
+Severity reflects impact under the trust boundary of §2. F2 below is
+**resolved** and kept for the record, with the code and test that closed it.
 
 ### F1 — High: the peer protocol is unauthenticated and bypasses the registry
 
@@ -355,9 +408,45 @@ refuse `journal` frames on `agent`-role links (`source is None`). Until
 then, place the listen port on a private network and treat every host that
 can reach it as a fully trusted peer.
 
+**Availability note (0.7.4).** The blast radius is now bounded rather than
+removed: inbound links are capped (`max_connections`, over the limit accept and
+close), one frame's work is capped (`max_actions_per_frame`), and a frame that
+cannot be decoded is refused cheaply instead of after the decoder has recursed.
+None of that authenticates a peer; the write path is unchanged and the finding
+stands.
+
 **Tracking.** [lolllll212/Conflux#2](https://github.com/lolllll212/Conflux/issues/2).
 
-### F2 — Low: malformed envelopes raise `TypeError` (fail-closed, not fail-clean)
+### F2 — Low: malformed envelopes raise `TypeError` (fail-closed, not fail-clean) — RESOLVED
+
+**Resolution (0.7.4).** All three vectors and the two the review did not name
+now fail clean, at the layer that owns the answer:
+
+- `verify_action` returns `False` for a signature that is not ASCII, before
+  `hmac.compare_digest` is reached (that call raises `TypeError` on non-ASCII
+  strings by design — a signature is hex, so "cannot compare" *is* "does not
+  match").
+- `validate_envelope` wraps `Action.import_action` and turns the `TypeError`
+  from an unexpected or missing key into `ValidationError("action is
+  malformed: …")`, so any caller — wire, journal replay, memory bridge — gets
+  the same typed refusal.
+- `JournalStore._verify` compares UTF-8 bytes, so a hand-edited `sig` on disk
+  reads as `journal signature mismatch (journal tampered?)` instead of a
+  `TypeError` while loading.
+- `Server._handle_message` answers `(TypeError, KeyError, AttributeError)` on
+  the `submit` path with `{"type": "error", "reason": "malformed action: …"}`
+  and keeps the connection; a `read` with a missing or non-string `key` is
+  answered the same way; a peer journal frame that cannot be understood is a
+  `ProtocolError`, which means counted and dropped rather than logged and lost.
+- `MemoryStore`'s bearer check compares bytes for the same reason: a token with
+  a stray non-ASCII character is a 401, not a 500 out of a security check.
+
+**Evidence.** `tests/test_security_review.py::test_a_signature_that_is_not_ascii_is_refused_not_raised`,
+`::test_unexpected_and_missing_action_keys_are_a_typed_refusal`,
+`::test_a_journal_line_signed_in_a_way_hmac_cannot_read_is_tampering`,
+`tests/test_fault_transport.py::test_a_malformed_submit_gets_an_answer_not_a_disconnection`,
+`::test_a_read_that_cannot_be_answered_is_answered_anyway`,
+`tests/test_memory_faults.py::test_a_token_that_is_not_ascii_is_rejected_in_cleanly`.
 
 **Description.** Three inputs escape `validate_envelope` as `TypeError`
 rather than `ValidationError`: a non-ASCII `signature` string
@@ -444,6 +533,17 @@ can break convergence. **Fix if required:** require
       monotonic (F6, `PROTOCOL.md` §8.1).
 - [ ] Do not expose `start_metrics_http` or the `admin` probe beyond the
       operations network (F5).
+- [ ] Set the bounds for the network you are actually on:
+      `--max-connections` (default 64) for a node that should serve a known
+      mesh, `--max-frame` and `--frame-bytes` together so a chunk is always
+      smaller than the frame a peer may accept, and
+      `--max-actions-per-frame` if your agents batch large submits.
+- [ ] Alert on the failure counters rather than on log text:
+      `conflux_malformed_frames_total`, `conflux_oversize_frames_total`,
+      `conflux_rejected_connections_total`, `conflux_gossip_errors_total`,
+      `conflux_links_dropped_total`, `conflux_resyncs_total`. A non-zero
+      `malformed_frames` is either a version skew or an attacker, and both are
+      worth a page at 3 a.m.
 
 ## 7. Reporting a vulnerability
 
@@ -465,6 +565,11 @@ version, the transport (`tcp`/`ws`, TLS on or off), whether a registry and
 | S5 | replayed action is a no-op on state | `tests/test_security_review.py`, `tests/test_prod_hardening.py`, `tests/test_spec_conformance.py`, `tests/test_crdts.py` |
 | S6 | signed lines and snapshots refuse keyless / tampered / stripped reload | `tests/test_security_review.py`, `tests/test_spec_conformance.py`, `tests/test_prod_hardening.py`, `tests/test_phase4.py` |
 
-Open findings F1–F6 are intentionally **not** pinned by tests, so that
+| S7 | an unusable frame is refused, counted and survived, on read and on write | `tests/test_fault_transport.py` |
+| S8 | work per frame, per connection and per gossip round is bounded | `tests/test_fault_transport.py`, `tests/test_prometheus.py` |
+| S8a | one writer per connection; idle-link heartbeats and resyncs are bounded and counted | `tests/test_fault_transport.py` |
+
+Open findings F1 and F3–F6 are intentionally **not** pinned by tests, so that
 fixing them does not require rewriting this document's evidence; each fix
-should add its own conformance test and move the finding to §4.
+should add its own conformance test and move the finding to §4 — which is what
+happened to F2, and why its tests are listed there.

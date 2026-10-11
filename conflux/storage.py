@@ -40,7 +40,8 @@ class JournalStore:
             return
         if not sig:
             raise ValueError("journal signature missing (tampered?)")
-        if not hmac.compare_digest(self._sign(payload), str(sig)):
+        claimed = str(sig).encode("utf-8", "replace")
+        if not hmac.compare_digest(self._sign(payload).encode("utf-8"), claimed):
             raise ValueError("journal signature mismatch (journal tampered?)")
 
     def load(self):

@@ -1,8 +1,9 @@
 """Conformance tests for the properties documented in docs/SECURITY.md (S1-S6).
 
 Each test pins one reviewed property to the code path that enforces it, in
-the same spirit as PROTOCOL.md's conformance index. Open findings (F1-F6 in
-the review) are deliberately not pinned here.
+the same spirit as PROTOCOL.md's conformance index. Open findings are
+deliberately not pinned here; the ones that have been fixed are, so a
+regression on a closed finding fails the suite.
 """
 import hashlib
 import hmac
@@ -210,3 +211,70 @@ def test_signed_journal_lines_refuse_reload_without_key(tmp_path):
         JournalStore(d, journal_secret="wrong-key").load()
     root, actions = JournalStore(d, journal_secret="journal-key").load()
     assert root is None and [a.action_id for a in actions] == ["act-a-1", "act-a-2"]
+
+
+# --- F2 closed: a malformed envelope is a refusal, never a traceback ----------
+
+
+def test_a_signature_that_is_not_ascii_is_refused_not_raised():
+    """hmac.compare_digest() refuses to compare non-ASCII strings by design.
+
+    An envelope whose signature contains one used to escape the validator as
+    TypeError, which in a connection thread is a traceback and a dropped socket
+    instead of the documented error reply.
+    """
+    registry = hmac_registry()
+    envelope = sign_action(make_action(), "secret-a")
+    for bad in ("caf\u00e9", "\ud800", "x" * 64 + "\u00e9"):
+        envelope["signature"] = bad
+        assert verify_action(envelope, "secret-a") is False
+    envelope["signature"] = "caf\u00e9"
+    with pytest.raises(ValidationError, match="signature verification failed"):
+        validate_envelope(envelope, registry)
+
+
+def test_unexpected_and_missing_action_keys_are_a_typed_refusal():
+    """Action(**data) raises TypeError for a wrong key set; callers expect ValidationError."""
+    registry = hmac_registry()
+    base = json.loads(json.dumps(sign_action(make_action(), "secret-a")))
+    for mutate in (lambda a: a.update({"surprise": 1}), lambda a: a.pop("op")):
+        broken = json.loads(json.dumps(base))
+        mutate(broken["action"])
+        with pytest.raises(ValidationError, match="action is malformed"):
+            validate_envelope(broken, registry)
+    # a key that exists but holds the wrong type is the schema's own business
+    broken = json.loads(json.dumps(base))
+    broken["action"]["action_id"] = None
+    with pytest.raises(ValidationError, match="action_id must be a non-empty string"):
+        validate_envelope(broken, registry)
+
+
+def test_a_journal_line_signed_in_a_way_hmac_cannot_read_is_tampering(tmp_path):
+    """The same class of fault on disk: "cannot compare" means "does not match".
+
+    A journal whose line was edited by hand (or by a truncating editor that
+    re-encoded it) must load as a refusal the operator can act on.
+    """
+    store = JournalStore(tmp_path, journal_secret="k")
+    store.append(make_action())
+    store.close()
+    path = tmp_path / "journal.jsonl"
+    entry = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    entry["sig"] = "not-hex-\u00e9"
+    path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    reader = JournalStore(tmp_path, journal_secret="k")
+    with pytest.raises(ValueError, match="journal signature mismatch"):
+        reader.load()
+
+
+def test_a_replayed_journal_names_the_broken_line():
+    from conflux.memory.bridge import MemoryFabric
+
+    fabric = MemoryFabric("agent-x", namespace="default")
+    fabric.put({"id": "m1", "body": "one fact", "state": "active"})
+    text = fabric.export_journal()
+    broken = "\n".join([text.splitlines()[0], "{not json", *text.splitlines()[1:]])
+    with pytest.raises(ValueError, match="journal line 2 is not JSON"):
+        MemoryFabric("agent-y", namespace="default").import_journal(broken)
+    with pytest.raises(ValueError, match="entry 1 is not a Conflux action"):
+        MemoryFabric("agent-z", namespace="default").import_actions([{"nope": 1}])

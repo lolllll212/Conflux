@@ -32,7 +32,7 @@ from .validate import (
 from .websocket import WebSocket, WSMessenger, WebSocketServer, connect_websocket
 from . import memory
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 __all__ = [
     "memory",

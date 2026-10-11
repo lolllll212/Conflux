@@ -221,6 +221,15 @@ store and migrations, dedupe and staleness analysis, cleanup planning and its
 safety floors, model fallbacks against a loopback stub server, the HTTP surface,
 the scheduler's clock behaviour, the fabric mirror, and the CLI).
 
+Fault drills run beside the unit tests, because the interesting failures are not
+"does this function return the right dict": `tests/test_fault_transport.py` puts a
+live node in front of peers that send garbage, dribble bytes, hang up mid-frame,
+open too many connections, or ask one frame to carry a million actions;
+`tests/test_memory_faults.py` kills processes mid-write, mounts the volume
+read-only, fills the disk, sends a sliced emoji, and checks what the audit trail
+says afterwards. Both files assert the *recovery* — counted, logged, bounded, and
+losing nothing already committed.
+
 The memory tests skip themselves when their optional dependencies are missing:
 `pip install 'conflux[memory]'` (or `conflux[test]`) to run all of them.
 
@@ -290,6 +299,14 @@ state-hash info label) are labeled with `node_id`:
 python benchmarks/bench.py            # replay, cluster, tcp + ws round-trips
 python benchmarks/bench.py --quick    # small sizes for CI
 ```
+
+Every failure counter above is a Prometheus series
+(`conflux_malformed_frames_total`, `conflux_oversize_frames_total`,
+`conflux_rejected_connections_total`, `conflux_gossip_errors_total`,
+`conflux_links_dropped_total`, `conflux_resyncs_total`), present at zero so that
+`rate()` over them means something, plus `conflux_link_cursor` per open link — an
+alert that fires only when a peer misbehaves is worth more than a log line nobody
+reads at 3 a.m.
 
 Example (previous run, this machine): ~168k actions/s journal replay,
 ~38k actions/s full-mesh cluster convergence, ~0.13 ms single-agent
@@ -417,6 +434,24 @@ Conflux promises, and the test suite verifies:
 - **Durable ack**: a submit is acknowledged only after the accepting node has
   absorbed the actions and fsynced them to its journal; an acked action
   survives that node's process crash (torn-tail recovery).
+- **Fail-clean transport**: a frame that is oversized, non-UTF-8, not a JSON
+  object, nested past the decoder's depth, truncated, or asking for more work
+  than one frame may carry is refused *before* it touches state — the peer link
+  is closed, the reason is logged, and `malformed_frames` / `oversize_frames` /
+  `rejected_connections` count it. A node never dies in a worker thread printing
+  a traceback nobody reads.
+- **Cost you can bound**: inbound links (`max_connections`), frame size
+  (`max_frame`), chunk size (`frame_batch_bytes`) and actions per frame
+  (`max_actions_per_frame`) are all CLI flags and all appear in `metrics()` and
+  the Prometheus text. Gossip keeps a journal *cursor* per link rather than a set
+  of every id sent, so a round costs what it delivered: on the dev box a steady
+  round measured 0.003 ms at 500 actions and 0.002 ms at 20 000, and a node whose
+  journal is larger than one frame is still joinable (chunked, `oversize_frames=0`)
+  instead of silently refusing the sync.
+- **Self-healing delivery**: an idle link heartbeats its canonical state root, so a
+  node that missed a frame (backpressure, a join racing a rotation) is pulled back
+  into agreement by a resend from the journal's start — bounded, counted, and needs
+  no operator. Live-but-quiet links stop being reaped as idle; dead ones still are.
 
 The exact limits — schema bounds, frame size, snapshot/gossip/stale defaults,
 backoff schedule, quota rules, and measured throughput (≈24k actions/s local
@@ -502,8 +537,10 @@ cumulative compaction) are complete.
 
 The remaining ideas in each phase are **backlog, deliberately out of scope**
 under the current product definition (§"Product definition and scope"): secure
-framing beyond TLS, multi-cluster federation, chunked cross-peer snapshot
-exchange, OpenTelemetry exporters, and workflow orchestration expansion. Each
+framing beyond TLS, multi-cluster federation, chunked cross-peer *snapshot*
+exchange (journal and `sync` delivery are already chunked — PROTOCOL §6.3 — a
+snapshot is a different object), OpenTelemetry exporters, and workflow
+orchestration expansion. Each
 is a candidate to revisit only after the core fabric — determinism, durability,
 crash recovery — is proven by adopters.
 
@@ -513,8 +550,9 @@ The cryptographic signing, identity verification, and storage subsystems are
 documented in [`docs/SECURITY.md`](docs/SECURITY.md): threat model and trust
 boundary, the properties the implementation enforces (constant-time
 verification, algorithm binding, canonical serialization, signer binding,
-replay idempotence, keyless-reload refusal), the findings that remain open,
-and a deployment checklist. To report a vulnerability, open a GitHub issue or
+replay idempotence, keyless-reload refusal, fail-clean framing, bounded work per
+frame and per connection), the findings that remain open, and a deployment
+checklist. To report a vulnerability, open a GitHub issue or
 contact the maintainer privately as described there.
 
 ## License

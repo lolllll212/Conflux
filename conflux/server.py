@@ -1,4 +1,6 @@
 import argparse
+import json
+import logging
 import queue
 import socket
 import ssl
@@ -7,7 +9,7 @@ import time
 
 from .actions import Action
 from .app import EventBus, Watcher, attach_listeners
-from .net import normalize_tls, recv_msg, send_msg, to_wire
+from .net import MAX_FRAME, ProtocolError, normalize_tls, recv_msg, send_msg, to_wire
 from .protocol import state_hash
 from .state import Replica
 from .storage import JournalStore
@@ -18,7 +20,17 @@ from .websocket import WebSocketServer, connect_websocket
 class Server:
     def __init__(self, node_id, address, peers=(), data_dir=None, gossip_interval=1.0,
                  snapshot_threshold=1000, registry=None, transport="tcp", batch_size=0,
-                 auto_discover=False, tls=None, journal_secret=None, stale_after=None):
+                 auto_discover=False, tls=None, journal_secret=None, stale_after=None,
+                 max_frame=MAX_FRAME, max_connections=64, frame_batch_bytes=1 << 20,
+                 max_actions_per_frame=100_000):
+        """Three knobs exist for the world outside a test: ``max_frame`` is the
+        largest frame a peer may hand us, ``max_connections`` how many inbound links
+        one process will hold open at all (each costs a thread plus receive buffer),
+        and ``frame_batch_bytes`` the budget a journal chunk is built to fit inside
+        so a node with a long journal can still be joined. ``max_actions_per_frame``
+        caps how much work one inbound frame may ask for: a frame inside the byte
+        cap can still hold a million tiny actions, and "valid JSON" is not the same
+        statement as "affordable to absorb"."""
         self.node_id = node_id
         self.address = tuple(address)
         self.peers = [tuple(p) for p in peers]
@@ -37,7 +49,14 @@ class Server:
         self.lock = threading.RLock()
         self._stopped = threading.Event()
         self._started_at = None
-        self._metrics = {"absorbed": 0, "submitted": 0}
+        self.max_frame = int(max_frame)
+        self.max_connections = max(1, int(max_connections))
+        self.frame_batch_bytes = int(frame_batch_bytes)
+        self.max_actions_per_frame = max(1, int(max_actions_per_frame))
+        self._connection_slots = threading.BoundedSemaphore(self.max_connections)
+        self._metrics = {"absorbed": 0, "submitted": 0, "malformed_frames": 0,
+                         "oversize_frames": 0, "rejected_connections": 0, "link_drops": 0,
+                         "handler_errors": 0, "gossip_errors": 0, "resyncs": 0}
         self._socket = None
         self._ws_server = None
         self._metrics_http = None
@@ -50,6 +69,7 @@ class Server:
         self.members = {}
         self._link_by_address = {}
 
+        self.log = logging.getLogger(f"conflux.server.{node_id}")
         self.store = JournalStore(data_dir, snapshot_threshold, journal_secret) if data_dir else None
         if self.store:
             root, actions = self.store.load()
@@ -161,6 +181,17 @@ class Server:
                 "members": len(self.members),
                 "gossip_interval": self.gossip_interval,
                 "state_hash": state_hash(self.replica.state),
+                "malformed_frames": self._metrics["malformed_frames"],
+                "oversize_frames": self._metrics["oversize_frames"],
+                "rejected_connections": self._metrics["rejected_connections"],
+                "link_drops": self._metrics["link_drops"],
+                "handler_errors": self._metrics["handler_errors"],
+                "gossip_errors": self._metrics["gossip_errors"],
+                "resyncs": self._metrics["resyncs"],
+                "max_connections": self.max_connections,
+                "max_actions_per_frame": self.max_actions_per_frame,
+                "link_cursors": {str(k): int(v.get("cursor", 0))
+                                 for k, v in list(self._links.items())[:8]},
             }
 
     def prometheus(self, namespace="conflux"):
@@ -180,8 +211,26 @@ class Server:
             "members": ("Peers known in the membership view.", m["members"]),
             "uptime_seconds": ("Seconds since this node started.", m["uptime_s"]),
             "gossip_interval_seconds": ("Gossip round interval.", m["gossip_interval"]),
+            "max_connections": ("Inbound links this node holds open at once.", m["max_connections"]),
+            "max_actions_per_frame": ("Actions one inbound frame may ask this node to absorb.",
+                                      m["max_actions_per_frame"]),
+            "links_dropped_total": ("Links dropped for idleness or a failed push.",
+                                    m["link_drops"]),
+            "malformed_frames_total": ("Frames refused before they could touch state.",
+                                       m["malformed_frames"]),
+            "rejected_connections_total": ("Inbound connections refused at the limit.",
+                                          m["rejected_connections"]),
+            "gossip_errors_total": ("Gossip rounds that raised and were survived.",
+                                    m["gossip_errors"]),
+            "handler_errors_total": ("Connection handlers that raised.", m["handler_errors"]),
+            "resyncs_total": ("Links asked to resend their journal after a heartbeat showed "
+                              "differing state roots.", m["resyncs"]),
+            "oversize_frames_total": ("Frames this node refused to emit because a peer "
+                                      "would be entitled to reject them.", m["oversize_frames"]),
         }
         lines = []
+        counters.update({k: v for k, v in gauges.items() if k.endswith("_total")})
+        gauges = {k: v for k, v in gauges.items() if not k.endswith("_total")}
         for name, (help_text, value) in counters.items():
             lines += [f"# HELP {namespace}_{name} {help_text}",
                       f"# TYPE {namespace}_{name} counter",
@@ -190,6 +239,14 @@ class Server:
             lines += [f"# HELP {namespace}_{name} {help_text}",
                       f"# TYPE {namespace}_{name} gauge",
                       f"{namespace}_{name}{{{labels}}} {value}"]
+        cursors = m["link_cursors"]
+        if cursors:
+            # one sample per link, one header block: repeating HELP per series is
+            # not legal exposition format and a scraper drops the type
+            lines += [f"# HELP {namespace}_link_cursor Actions of the journal delivered to a link.",
+                      f"# TYPE {namespace}_link_cursor gauge"]
+            lines += [f'{namespace}_link_cursor{{node_id="{self.node_id}",link="{key}"}} {value}'
+                      for key, value in cursors.items()]
         lines += [f'# HELP {namespace}_state_hash_info Current canonical state hash.',
                   f'# TYPE {namespace}_state_hash_info gauge',
                   f'{namespace}_state_hash_info{{node_id="{self.node_id}",hash="{m["state_hash"]}"}} 1']
@@ -246,7 +303,20 @@ class Server:
         with self.lock:
             return sorted(self.discovered)
 
+    def _note(self, metric, message, *args):
+        """Count and log an anomaly once, instead of letting it vanish with a thread.
+
+        Every one of these is a thing a node can get wrong quietly: a peer that
+        sends garbage, a link dropped for idleness, a connection refused because the
+        node is at its limit. Without a counter each looks identical to "fine".
+        """
+        with self.lock:
+            self._metrics[metric] = self._metrics.get(metric, 0) + 1
+        self.log.warning(message, *args)
+
     def _accept_loop(self):
+        # One accept loop per node: an unexpected error here is the difference
+        # between a cluster that heals and one that quietly stops being joinable.
         while not self._stopped.is_set():
             try:
                 conn, _ = self._socket.accept()
@@ -258,34 +328,74 @@ class Server:
                 except OSError:
                     pass
                 break
-            threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
+            if not self._connection_slots.acquire(blocking=False):
+                self._note("rejected_connections",
+                           "at %d inbound links; refusing another connection "
+                           "(raise max_connections if that is too low)", self.max_connections)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            threading.Thread(target=self._handle_conn, args=(conn,), daemon=True,
+                             name="conflux-link").start()
 
     def _handle_conn(self, conn):
         conn.settimeout(10)
+        registered = []
+        write_lock = threading.Lock()
 
         def send(obj):
-            send_msg(conn, obj)
+            # a link's outbound queue is drained by its own thread while this thread
+            # answers hello_ack, journal pushes and sync requests: two sendall calls
+            # on one socket interleave as soon as a frame needs more than one write,
+            # and the peer then reads a length prefix belonging to the other frame
+            with write_lock:
+                send_msg(conn, obj, max_frame=self.max_frame)
 
         def recv():
-            return recv_msg(conn)
+            return recv_msg(conn, max_frame=self.max_frame)
 
         try:
-            self._conn_loop(send, recv, conn.close)
-        except (ConnectionError, OSError, ValueError):
+            self._conn_loop(send, recv, conn.close, registered)
+        except ProtocolError as exc:
+            # a peer that sends garbage is disconnected, not argued with - but the
+            # reason is counted, so a noisy neighbour is distinguishable from a bug
+            self._note("malformed_frames", "dropping a link after a bad frame: %s", exc)
+        except (ConnectionError, OSError):
             pass
+        except Exception as exc:
+            # anything else is our bug: report it and still close cleanly, because
+            # a traceback printed from a dying thread is not an audit trail
+            self._note("handler_errors", "connection handler failed: %s: %s",
+                       type(exc).__name__, exc)
         finally:
+            for key in registered:
+                # a link registered before its reader died must not linger: with no
+                # address for the staleness reaper to key on, it kept a sender
+                # thread alive for the life of the process
+                self._drop_link(key)
             try:
                 conn.close()
             except OSError:
                 pass
+            self._connection_slots.release()
 
     def _handle_ws_conn(self, ws):
+        registered = []
         try:
-            self._conn_loop(ws.send_json, lambda: ws.recv_json(), ws.close)
+            self._conn_loop(ws.send_json, lambda: ws.recv_json(), ws.close, registered)
         except (ConnectionError, OSError, ValueError):
             pass
+        finally:
+            for key in registered:
+                self._drop_link(key)
+            try:
+                ws.close()
+            except (ConnectionError, OSError):
+                pass
 
-    def _conn_loop(self, send, recv, close):
+    def _conn_loop(self, send, recv, close, registered=None):
         hello = recv()
         if not hello:
             return
@@ -296,6 +406,8 @@ class Server:
             far_address = tuple(hello["address"]) if hello.get("address") else None
             key = self._register_link(send, recv, close=close,
                                       address=far_address, peer_id=peer_id)
+            if registered is not None:
+                registered.append(key)
             if hello.get("members"):
                 self._member_see_all(hello["members"])
             candidates = [far_address] + list(hello.get("peers", []))
@@ -317,6 +429,12 @@ class Server:
         while not self._stopped.is_set():
             try:
                 msg = recv()
+            except ProtocolError as exc:
+                # a peer that hands us an unreadable frame is a different incident
+                # from a peer that hangs up, and only one of them wants a human
+                self._note("malformed_frames", "peer %s sent an unusable frame: %s",
+                           self._links.get(key, {}).get("peer_id"), exc)
+                break
             except (ConnectionError, OSError, ValueError):
                 break
             if msg is None:
@@ -324,29 +442,88 @@ class Server:
             self._touch_link(key)
             try:
                 self._handle_message(msg, send, key)
+            except ProtocolError as exc:
+                self._note("malformed_frames", "rejecting a message from a peer: %s", exc)
+                break
             except (ConnectionError, OSError, ValueError):
                 break
         if key is not None:
             self._drop_link(key)
 
+    def _consider_resync(self, msg, key):
+        """A heartbeat whose hash is not ours: ask that peer to resend to us.
+
+        Rate-limited by one outstanding request per link (`resyncing`), because a
+        pair that is genuinely converging by other means must not stampede each
+        other with full journal resends every round.
+        """
+        if key is None:
+            return  # an agent link has no journal to resync
+        peer_hash = msg.get("hash")
+        if not isinstance(peer_hash, str) or not peer_hash:
+            return
+        with self.lock:
+            info = self._links.get(key)
+            if info is None or info.get("resyncing"):
+                return
+            mine = state_hash(self.replica.state)
+            if peer_hash == mine:
+                return
+            info["resyncing"] = time.time()
+        self._note("resyncs", "peer %s reports a different state root; asking it to resend",
+                   msg.get("node_id") or info.get("peer_id"))
+        self._enqueue(key, {"type": "resync", "node_id": self.node_id})
+
+    def _frame_actions(self, msg):
+        """The action list of a frame, or ``None`` if the frame asks for too much.
+
+        A non-list is a malformed frame, so it raises; an over-long list is a
+        *budget*, so the caller decides whether to answer (agent) or hang up (peer).
+        """
+        raw = msg.get("actions", [])
+        if not isinstance(raw, list):
+            raise ProtocolError(f"'actions' must be a list, not {type(raw).__name__}")
+        if len(raw) > self.max_actions_per_frame:
+            self._note("oversize_frames", "a frame carried %d actions (cap %d)",
+                       len(raw), self.max_actions_per_frame)
+            return None
+        return raw
+
     def _handle_message(self, msg, send, source):
         if msg.get("type") == "submit":
+            incoming = self._frame_actions(msg)
+            if incoming is None:
+                send({"type": "error", "reason": f"submit carries more than "
+                       f"{self.max_actions_per_frame} actions; split it"})
+                return
             try:
                 if self.registry is not None:
-                    actions = [validate_envelope(env, self.registry) for env in msg.get("actions", [])]
+                    actions = [validate_envelope(env, self.registry) for env in incoming]
                 else:
-                    actions = [Action.import_action(d) for d in msg.get("actions", [])]
+                    actions = [Action.import_action(d) for d in incoming]
                     for action in actions:
                         validate_action(action)
             except ValidationError as exc:
                 send({"type": "error", "reason": str(exc)})
+                return
+            except (TypeError, KeyError, AttributeError) as exc:
+                # an agent that posts a half-built action is a client bug, not a
+                # peer to disconnect: answer with the reason and keep serving them
+                self._note("malformed_frames", "rejected a submit: %s: %s",
+                           type(exc).__name__, exc)
+                send({"type": "error", "reason": f"malformed action: {exc}"})
                 return
             self._absorb(actions)
             with self.lock:
                 self._metrics["submitted"] += len(actions)
             send({"type": "ack", "node_id": self.node_id, "accepted": len(actions)})
         elif msg.get("type") == "read":
-            send({"type": "read_resp", "key": msg["key"], "value": to_wire(self.read(msg["key"]))})
+            key = msg.get("key")
+            if not isinstance(key, str) or not key:
+                self._note("malformed_frames", "rejected a read: 'key' must be a non-empty string")
+                send({"type": "error", "reason": "read needs a string 'key'"})
+                return
+            send({"type": "read_resp", "key": key, "value": to_wire(self.read(key))})
         elif msg.get("type") == "read_all":
             send({"type": "read_resp", "value": to_wire(self.view())})
         elif msg.get("type") == "hash":
@@ -354,12 +531,29 @@ class Server:
         elif msg.get("type") == "sync":
             self._send_journal(send)
         elif msg.get("type") == "journal":
+            incoming = self._frame_actions(msg)
+            if incoming is None:
+                # a peer that asks for more than one frame's worth of work is not
+                # having a bad day, it is either misconfigured or hostile: say so,
+                # count it, and hang up rather than grinding through the list
+                raise ProtocolError(f"peer sent more than {self.max_actions_per_frame} "
+                                    f"actions in one frame; refusing")
             try:
-                actions = [validate_action(Action.import_action(d))
-                           for d in msg.get("actions", [])]
+                actions = [validate_action(Action.import_action(d)) for d in incoming]
             except (TypeError, ValueError, KeyError, ValidationError) as exc:
-                raise ValueError(f"malformed peer journal: {exc}") from exc
+                raise ProtocolError(f"malformed peer journal: {exc}") from exc
             self._absorb(actions)
+        elif msg.get("type") == "heartbeat":
+            self._consider_resync(msg, source)
+        elif msg.get("type") == "resync":
+            # the peer's state root differs from ours and it asked us to speak: send
+            # everything, from index 0. At-least-once plus action_id dedup means a
+            # needless resend costs bandwidth and nothing else
+            if source is not None:
+                info = self._links.get(source)
+                if info is not None:
+                    info["cursor"] = 0
+                    self._push_link(source, info, start=0)
         elif msg.get("type") == "hello_ack":
             self._discover(msg.get("peers", []))
             if msg.get("members"):
@@ -384,10 +578,48 @@ class Server:
                 if rotate:
                     self.store.rotate(self.replica.state._map)
 
-    def _send_journal(self, send):
+    def _export_range(self, start=0):
+        """Exported journal actions from ``start`` on, under the node lock."""
         with self.lock:
-            actions = [a.export() for a in self.replica.journal]
-        send({"type": "journal", "actions": actions})
+            return [action.export() for action in self.replica.journal[start:]]
+
+    def _frame_budget(self):
+        """Bytes one gossip frame may take: the batch budget, and never the cap."""
+        budget = int(self.frame_batch_bytes or 0) or (1 << 20)
+        if self.max_frame:
+            budget = min(budget, int(self.max_frame))
+        return max(4096, budget)
+
+    @staticmethod
+    def chunk_exported(actions, *, max_actions=0, max_bytes=1 << 20):
+        """Group exported actions into frames that fit a count *and* a byte budget.
+
+        A frame over the peer's cap is not merely late, it is refused: the link
+        closes, the peer redials, and the same oversize frame is refused again. That
+        is how a node whose journal outgrew one frame becomes permanently
+        unjoinable, so the sender chunks before it ever builds the frame.
+        """
+        chunk, size = [], 0
+        for export in actions:
+            # measured per action, so one enormous action still ships (it has to)
+            # and the running sum stays an upper bound on the frame
+            weight = len(json.dumps(export)) + 1
+            if chunk and (size + weight > max_bytes
+                          or (max_actions and len(chunk) >= max_actions)):
+                yield chunk, size
+                chunk, size = [], 0
+            chunk.append(export)
+            size += weight
+        if chunk:
+            yield chunk, size
+
+    def _send_journal(self, send):
+        # chunked, never one frame per sync: this is the path a joining agent uses
+        # to catch up, and a single frame of the whole journal is what an oversized
+        # peer rejects
+        for chunk, size in self.chunk_exported(self._export_range(), max_actions=self.batch_size,
+                                                max_bytes=self._frame_budget()):
+            send({"type": "journal", "actions": chunk})
 
     def _peer_list(self):
         with self.lock:
@@ -411,8 +643,13 @@ class Server:
     def _register_link(self, send, recv, close=None, address=None, peer_id=None):
         key = id(send)
         with self.lock:
+            # ``cursor`` is an index into the append-only journal, not a set of
+            # action ids: a per-peer set of everything ever gossiped grows for the
+            # life of the process (one entry per action per peer) and turns every
+            # gossip round into a full journal scan, which is exactly how a node
+            # that ran for a month starts lagging.
             self._links[key] = {"send": send, "recv": recv, "close": close or (lambda: None),
-                                "sent": set(), "queued": set(), "address": address,
+                                "cursor": 0, "acked": 0, "address": address,
                                 "peer_id": peer_id, "last_seen": time.time(),
                                 "outgoing": queue.Queue(maxsize=256)}
             if address is not None:
@@ -432,24 +669,30 @@ class Server:
                 return
             try:
                 info["send"](msg)
-            except (ConnectionError, OSError, ValueError):
+            except (ConnectionError, OSError, ValueError) as exc:
+                self.log.info("link %s closed after a send failure: %s", info.get("peer_id"), exc)
                 self._drop_link(key)
                 return
-            with self.lock:
-                for export in msg.get("actions", ()):
-                    info["sent"].add(export["action_id"])
-                    info["queued"].discard(export["action_id"])
+            # only now is the peer's cursor allowed to move: what is queued but
+            # unwritten stays owed, and the next round retries from here
+            info["acked"] = max(int(info.get("acked", 0)), int(msg.get("through", 0) or 0))
 
-    def _enqueue(self, key, payload, actions):
+    def _enqueue(self, key, payload):
+        """Hand one frame to a link's sender. False means "not now" (backpressure).
+
+        The per-link queue is bounded on purpose: a peer that cannot drain its own
+        inbox must not turn this process into its buffer. The caller leaves the
+        cursor where it is, so nothing is marked delivered and the next round
+        retries - delivery is at-least-once, and absorb dedupes by action id.
+        """
         info = self._links.get(key)
         if info is None:
-            return
+            return False
         try:
             info["outgoing"].put_nowait(payload)
         except queue.Full:
-            return
-        with self.lock:
-            info["queued"].update(a["action_id"] for a in actions)
+            return False
+        return True
 
     def _touch_link(self, key):
         if key is not None:
@@ -482,12 +725,35 @@ class Server:
                     for n, info in self.members.items()}
 
     def _send_all(self, key):
+        """Catch a brand-new link up, in frames the peer will accept."""
         info = self._links.get(key)
         if info is None:
             return
-        with self.lock:
-            actions = [a.export() for a in self.replica.journal]
-        self._enqueue(key, {"type": "journal", "actions": actions}, actions)
+        self._push_link(key, info, start=0)
+
+    def _push_link(self, key, info, start):
+        """Deliver journal actions from ``start`` on, advancing the cursor as we go."""
+        journal_len = len(self.replica.journal)
+        if start > journal_len:
+            start = 0  # the journal shrank under us (a future compaction): restart
+        delivered = start
+        for chunk, size in self.chunk_exported(self._export_range(start),
+                                                max_actions=self.batch_size,
+                                                max_bytes=self._frame_budget()):
+            if self.max_frame and size > self.max_frame:
+                # a single action bigger than the cap: nothing we can chunk about
+                self._note("oversize_frames",
+                           "journal frame of %d bytes exceeds the %d byte cap; the peer "
+                           "will refuse it - shrink the action or raise max_frame",
+                           size, self.max_frame)
+            if not self._enqueue(key, {"type": "journal", "actions": chunk,
+                                       "through": delivered + len(chunk)}):
+                break  # the link is behind; retry from here on the next round
+            delivered += len(chunk)
+        info["cursor"] = delivered
+        if delivered >= journal_len:
+            info.pop("resyncing", None)
+        return delivered - start
 
     def _drop_link(self, key):
         with self.lock:
@@ -511,31 +777,73 @@ class Server:
                 pass
 
     def _gossip_loop(self):
+        failures = 0
         while not self._stopped.is_set():
-            now = time.time()
-            for key, info in list(self._links.items()):
-                if info.get("address") and now - info.get("last_seen", now) > self.stale_after:
-                    with self.lock:
-                        self._peer_failures[info["address"]] = self._peer_failures.get(
-                            info["address"], 0) + 1
-                    self._drop_link(key)
-            for address in list(self.peers):
-                address = tuple(address)
-                if address in self._outbound or address in self._dialing:
-                    continue
-                failures = self._peer_failures.get(address, 0)
-                if failures and self._gossip_tick % (2 ** min(failures, 6)) != 0:
-                    continue
-                with self.lock:
-                    if address in self._dialing:
-                        continue
-                    self._dialing.add(address)
-                threading.Thread(target=self._dial_worker, args=(address,), daemon=True).start()
-            if self.auto_discover:
-                self._merge_discovery()
-            self._push_to_peers()
-            self._gossip_tick += 1
+            try:
+                self._gossip_round()
+                failures = 0
+            except Exception as exc:
+                # The gossip loop is the only thing that pushes state to peers. It
+                # may not die: one unusable member or address entry used to stop
+                # this node converging with anyone, silently, until it restarted.
+                failures += 1
+                self._note("gossip_errors", "gossip round failed (%d in a row): %s: %s",
+                           failures, type(exc).__name__, exc)
+                self._stopped.wait(min(self.gossip_interval * 2 ** min(failures, 5), 30.0))
+                continue
             self._stopped.wait(self.gossip_interval)
+
+    def _gossip_round(self):
+        now = time.time()
+        for key, info in list(self._links.items()):
+            idle = now - info.get("last_seen", now)
+            if idle > self.stale_after:
+                address = info.get("address")
+                if address is not None:
+                    with self.lock:
+                        self._peer_failures[address] = self._peer_failures.get(address, 0) + 1
+                self._note("link_drops", "dropping a link idle for %.1fs (peer=%s)",
+                           idle, info.get("peer_id"))
+                self._drop_link(key)
+        for address in list(self.peers):
+            address = tuple(address)
+            if address in self._outbound or address in self._dialing:
+                continue
+            failures = self._peer_failures.get(address, 0)
+            if failures and self._gossip_tick % (2 ** min(failures, 6)) != 0:
+                continue
+            with self.lock:
+                if address in self._dialing:
+                    continue
+                self._dialing.add(address)
+            threading.Thread(target=self._dial_worker, args=(address,), daemon=True).start()
+        if self.auto_discover:
+            self._merge_discovery()
+        self._push_to_peers()
+        self._heartbeat_links(now)
+        self._gossip_tick += 1
+
+    def _heartbeat_links(self, now):
+        """Tell every link that has nothing to send what our state root is.
+
+        Two jobs, one small frame. A link that never carries traffic used to be
+        reaped as idle and re-dialled, so a converged pair churned - threads,
+        registrations and log lines - forever; and a node that silently missed
+        gossip (a dropped frame under backpressure, a journal rotation the peer
+        raced) had no way to notice. The hash is the node's own canonical
+        ``state_hash``, so a mismatch is a *fact* about divergence, not a guess
+        about timing.
+        """
+        # self.hash() rather than a bare state_hash(): the writer thread mutates the
+        # map under the lock, and hashing the live OrMap from here could see it change
+        # size mid-iteration - an exception in the gossip loop, on the read path's cost
+        mine = self.hash()
+        journal_len = len(self.replica.journal)
+        for key, info in list(self._links.items()):
+            if info.get("cursor", 0) < journal_len:
+                continue  # it has data coming; a heartbeat would only add noise
+            self._enqueue(key, {"type": "heartbeat", "node_id": self.node_id,
+                                "hash": mine, "journal": journal_len})
 
     def _dial_worker(self, address):
         try:
@@ -617,18 +925,15 @@ class Server:
     def _push_to_peers(self):
         for key, info in list(self._links.items()):
             try:
-                with self.lock:
-                    pending = [a.export() for a in self.replica.journal
-                               if a.action_id not in info["sent"]
-                               and a.action_id not in info["queued"]]
-                if not pending:
-                    continue
-                chunks = [pending[i:i + self.batch_size] for i in range(0, len(pending),
-                          self.batch_size)] if self.batch_size > 0 else [pending]
-                for chunk in chunks:
-                    self._enqueue(key, {"type": "journal", "actions": chunk}, chunk)
+                self._push_link(key, info, int(info.get("cursor", 0)))
             except (KeyError, AttributeError):
                 continue
+            except Exception as exc:
+                # a link that cannot be pushed to is dropped, not left half-sent:
+                # the cursor would otherwise advance over actions nobody received
+                self._note("link_drops", "dropping link %s after a push failure: %s: %s",
+                           info.get("peer_id"), type(exc).__name__, exc)
+                self._drop_link(key)
 
 
 def main(argv=None):
@@ -642,6 +947,15 @@ def main(argv=None):
     parser.add_argument("--transport", choices=("tcp", "ws"), default="tcp")
     parser.add_argument("--batch-size", type=int, default=0,
                         help="max journal actions per gossip frame (0 = unlimited)")
+    parser.add_argument("--frame-bytes", type=int, default=1 << 20,
+                        help="byte budget per gossip frame; a journal longer than one "
+                             "frame is chunked, never sent oversize and refused")
+    parser.add_argument("--max-frame", type=int, default=64 * 1024 * 1024,
+                        help="largest frame accepted from, or sent to, a peer")
+    parser.add_argument("--max-actions-per-frame", type=int, default=100_000,
+                        help="refuse a frame that asks this node to absorb more actions than this")
+    parser.add_argument("--max-connections", type=int, default=64,
+                        help="inbound links held open at once; beyond it, accept and close")
     parser.add_argument("--auto-discover", action="store_true",
                         help="wire peers advertised by linked nodes")
     parser.add_argument("--cert", default=None, help="TLS certificate (PEM); enables TLS framing")
@@ -674,6 +988,10 @@ def main(argv=None):
         tls=(args.cert, args.key) if args.cert else None,
         journal_secret=args.journal_key,
         stale_after=args.stale_after,
+        max_frame=args.max_frame,
+        max_connections=args.max_connections,
+        frame_batch_bytes=args.frame_bytes,
+        max_actions_per_frame=args.max_actions_per_frame,
     )
     server.start()
     print(f"node {args.id} listening on {server.node_address[0]}:{server.node_address[1]} "

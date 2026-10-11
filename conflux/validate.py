@@ -221,6 +221,10 @@ def verify_action(envelope, secret, alg=ALG_HMAC):
         signature, str
     ):
         return False
+    if not signature.isascii():
+        # compare_digest() refuses to compare strings containing non-ASCII, which used
+        # to escape as TypeError from a caller that only expected "invalid signature"
+        return False
     expected = hmac.new(secret.encode("utf-8"), canonical_action_bytes(action_dict),
                         hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
@@ -287,7 +291,13 @@ def validate_envelope(envelope, registry):
     action_data = envelope.get("action")
     if not isinstance(action_data, dict):
         raise ValidationError("envelope has no action")
-    action = validate_action(Action.import_action(action_data))
+    try:
+        action = validate_action(Action.import_action(action_data))
+    except TypeError as exc:
+        # Action(**data) raises TypeError for a missing or unexpected key. The caller
+        # asked "is this envelope valid?"; the answer is a ValidationError that says
+        # which field, not a TypeError that escapes into the connection thread.
+        raise ValidationError(f"action is malformed: {exc}") from exc
     signed_by = envelope.get("signed_by")
     if not isinstance(signed_by, str) or signed_by != action.agent:
         raise ValidationError("signed_by does not match action agent")
