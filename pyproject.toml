@@ -12,10 +12,13 @@ license = { text = "MIT" }
 
 [project.optional-dependencies]
 crypto = ["cryptography>=3.4"]
-test = ["pytest", "cryptography>=3.4"]
+# The memory layer's core (store, dedupe, staleness, cleanup, scheduler, CLI) is
+# stdlib-only. These extras are for the optional HTTP service on top of it.
+memory = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+test = ["pytest", "cryptography>=3.4", "fastapi>=0.110", "httpx>=0.27"]
 
 [tool.setuptools]
-packages = ["conflux"]
+packages = ["conflux", "conflux.memory"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

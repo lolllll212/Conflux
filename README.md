@@ -214,9 +214,15 @@ network-framework gossip path, the networked backend (client round-trip,
 two-node gossip convergence, restart persistence), signed-envelope authority,
 namespaces, the WebSocket transport (RFC6455 framing, WS node convergence,
 discovery, batching, backoff), the application layer (events, watchers,
-task state, deterministic workflows), and the operational surface (TLS framing
+task state, deterministic workflows), the operational surface (TLS framing
 over tcp + ws, signed/verified journals, membership + partition heal, and
-cumulative snapshot compaction).
+cumulative snapshot compaction), and the memory layer (`tests/test_memory_*.py`:
+store and migrations, dedupe and staleness analysis, cleanup planning and its
+safety floors, model fallbacks against a loopback stub server, the HTTP surface,
+the scheduler's clock behaviour, the fabric mirror, and the CLI).
+
+The memory tests skip themselves when their optional dependencies are missing:
+`pip install 'conflux[memory]'` (or `conflux[test]`) to run all of them.
 
 ## Application layer: workflows, tasks, events, watchers
 
@@ -430,6 +436,62 @@ Honest limits:
 - **Fixed-point weights**: probabilistic decisions use a fixed 32-bit scale over
   the same serialized `weight`, so all replicas agree as long as `weight` is a
   JSON number.
+
+## Self-pruning memory layer
+
+Agents write facts far faster than anyone re-reads them. `conflux.memory` is a
+SQLite memory store with an audit trail and a cleanup pass on top of it:
+restatements get folded, dead facts get retired, and anything the machine is not
+certain about goes into a review queue instead of into the void. It needs no
+model, no network and no server, and it never deletes anything by accident.
+
+```python
+from conflux.memory import CleanupService
+
+svc = CleanupService("memories.db", namespace="team-b")
+svc.store.add(body="cache TTL is 30s for the session store", kind="note", topic="cache",
+              source="incident-2026-08", on_duplicate="insert")
+svc.store.add(body="the session-store cache TTL is 30s", kind="note", topic="cache")
+svc.store.add(body="cache TTL is 45s for the session store", kind="note", topic="cache")
+
+report = svc.run()                          # dry run: nothing is written
+print(report.stats["clusters"], report.stats["merges_proposed"], report.stats["reviews"])
+# 1 1 1        one cluster, one fold proposed, one item queued for review
+
+run_id, outcome = svc.apply_run(report.run_id)     # that plan, revalidated row by row
+print(svc.store.reviews(state="open")[0]["kind"])  # 'contradiction' - a human decides
+svc.close()
+```
+
+A re-stated fact is never a second fact: `add()` fingerprints `(kind, topic,
+normalized body)` and touches the row it matched. A pass then groups what is left,
+and only *exact* folds are auto-applied by default — paraphrases, contradictions
+and anything a floor clipped go to the review queue, which is a table you can
+read from the CLI, the API or `store.reviews()`.
+
+Everything is also a command and, if you want it, an HTTP service:
+
+```console
+$ python -m conflux.memory run --db memories.db --explain       # dry run + reasons
+$ python -m conflux.memory reviews --db memories.db --json
+$ python -m conflux.memory review --db memories.db 4 --decision approve --note "same fact"
+$ python -m conflux.memory serve --db memories.db --port 8765    # pip install 'conflux[memory]'
+```
+
+What a pass may and may not do:
+
+| It may                                   | It never does                                    |
+| ---------------------------------------- | ------------------------------------------------ |
+| fold N restatements into one new record    | delete a row (`allow_hard_delete` + an explicit cutoff, and only via `purge`) |
+| archive a memory as stale or unused      | act on a contradiction — that goes to review      |
+| apply a plan a dry run recorded          | empty the store (`min_active_memories`, `max_prune_fraction`) |
+| run on a schedule, once per UTC slot      | call a remote model (loopback only, and optional) |
+
+[`docs/MEMORY.md`](docs/MEMORY.md) is the authoritative description: the schema,
+every one of the 43 policy knobs, the decision procedure with its measured
+similarity calibration, the 16 numbered claims and the test that pins each, and
+the limits. `examples/self_pruning_memory_demo.py` runs the whole story in one
+file.
 
 ## Roadmap -> status
 

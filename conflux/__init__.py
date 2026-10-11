@@ -30,10 +30,12 @@ from .validate import (
     verify_action,
 )
 from .websocket import WebSocket, WSMessenger, WebSocketServer, connect_websocket
+from . import memory
 
 __version__ = "0.7.3"
 
 __all__ = [
+    "memory",
     "Action",
     "ACTION_VERSION",
     "decide",
