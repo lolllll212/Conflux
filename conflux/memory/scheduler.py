@@ -161,6 +161,12 @@ class CleanupScheduler:
             return None
         if self._thread is not None and self._thread.is_alive():
             return self._thread
+        if getattr(self.service.store, "read_only", False):
+            # arming a thread that can only fail every tick turns one broken volume
+            # into a log full of noise; say it once and stay stopped
+            self.log.warning("scheduler not started: %s",
+                             self.service.store.degraded or "the database is read-only")
+            return None
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="conflux-memory-scheduler",
                                         daemon=True)

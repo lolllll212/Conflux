@@ -57,6 +57,9 @@ def _parser():
     def with_db(sp):
         sp.add_argument("--db", required=True, help="path to the SQLite memory database")
         sp.add_argument("--namespace", default="default", help="memory namespace (default: default)")
+        sp.add_argument("--durability", choices=("durable", "balanced"), default="durable",
+                        help="durable: fsync every commit (default); balanced: synchronous=NORMAL, "
+                             "crash-safe for a dying process, several times the throughput")
         return sp
 
     run = add("run", help="plan (default) or apply one cleanup pass")
@@ -73,6 +76,8 @@ def _parser():
     with_db(serve)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--max-body-bytes", type=int, default=1 << 20,
+                       help="refuse a request larger than this before parsing it (413)")
     serve.add_argument("--no-scheduler", action="store_true", help="disable the nightly pass")
     serve.add_argument("--dry-run-schedule", action="store_true",
                        help="scheduled passes only propose; they never mutate")
@@ -142,6 +147,13 @@ def _parser():
     with_db(apply_cmd)
     apply_cmd.add_argument("run_id")
 
+    checkpoint_cmd = add("checkpoint", help="fold the write-ahead log back into the database file")
+    with_db(checkpoint_cmd)
+    checkpoint_cmd.add_argument("--no-truncate", action="store_true",
+                               help="checkpoint without truncating the -wal file")
+    checkpoint_cmd.add_argument("--json", action="store_true",
+                                help="print the checkpoint result as JSON")
+
     backup = add("backup", help="VACUUM INTO a timestamped snapshot file")
     with_db(backup)
     backup.add_argument("--dest", default=None)
@@ -179,7 +191,14 @@ _SAMPLE_POLICY = {
 # --- commands ----------------------------------------------------------------
 
 
+def _store(args, **kwargs):
+    """Every command opens the store the same way, durability flag included."""
+    return MemoryStore(args.db, namespace=args.namespace,
+                       durability=getattr(args, "durability", "durable"), **kwargs)
+
+
 def _service(args, **kwargs):
+    kwargs.setdefault("durability", getattr(args, "durability", "durable"))
     return CleanupService(args.db, namespace=args.namespace, **kwargs)
 
 
@@ -195,7 +214,7 @@ def _parse_assignment(text):
 
 
 def _run_run(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     # --model is a one-run override: it is layered on the stored policy instead of
     # being written into settings, where it would silently outlive the invocation
     policy = store.get_policy(namespace=args.namespace)
@@ -261,17 +280,20 @@ def _run_serve(args):
         raise SystemExit("serve needs the memory extras: pip install 'conflux[memory]'")
     from .api import create_app
     service = _service(args)
-    app = create_app(service, start_scheduler=not args.no_scheduler,
-                     scheduler=None)
+    app = create_app(service, start_scheduler=not args.no_scheduler, scheduler=None,
+                     max_body_bytes=args.max_body_bytes, durability=args.durability)
     app.state.scheduler.dry_run = bool(args.dry_run_schedule)
     print(f"conflux memory api on http://{args.host}:{args.port}  db={args.db}  "
           f"namespace={args.namespace}  scheduler={'on' if not args.no_scheduler else 'off'}")
     print("docs at /docs; token auth " +
           ("REQUIRED (CONFLUX_MEMORY_TOKEN set)" if _token_set() else "off (loopback only)"))
     try:
-        uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="info")
+        # uvicorn buffers a request before the app sees it, so the byte budget has to
+        # be its too - otherwise "refused at 1 MiB" is only true after 16 MiB arrived
+        uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="info",
+                    h11_max_incomplete_event_size=max(int(args.max_body_bytes) + 65536, 1 << 16))
     finally:
-        service.store.close()
+        service.close()
     return 0
 
 
@@ -316,7 +338,7 @@ def _run_sample(args):
 
 
 def _run_add(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         receipt = store.add(args.body, kind=args.kind, topic=args.topic, source_agent=args.agent,
                             uri=args.uri, importance=args.importance, ttl_days=args.ttl_days,
@@ -332,7 +354,7 @@ def _run_add(args):
 
 
 def _run_list(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         state = None if args.state in ("all", "") else args.state
         if state is not None and state not in STATES:
@@ -354,7 +376,7 @@ def _run_list(args):
 
 
 def _run_reviews(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         rows = store.reviews(state=None if args.all else "open", limit=100)
         if getattr(args, "json", False):
@@ -389,7 +411,7 @@ def _run_review(args):
 
 
 def _run_merges(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         rows = store.merges(state=None if args.state == "all" else args.state, limit=args.limit)
         if getattr(args, "json", False):
@@ -420,7 +442,7 @@ def _run_revert(args):
 
 
 def _run_settings(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         policy = store.get_policy(namespace=args.namespace)
         if not args.set:
@@ -474,10 +496,16 @@ def _run_backup(args):
 
 
 def _run_verify(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
+        info = store.info()
         report = {"integrity": store.integrity_check(), "counts": store.counts(),
-                  "schema": store.schema_version}
+                  "schema": store.schema_version,
+                  "environment": {"read_only": info["read_only"], "durability": info["durability"],
+                                  "interrupted_runs": list(store.interrupted_runs or ()),
+                                  "bytes": info.get("bytes")}}
+        if store.degraded:
+            report["environment"]["degraded"] = store.degraded
         if args.mirror:
             from .bridge import MemoryFabric
             fabric = MemoryFabric("verify", namespace=args.namespace)
@@ -506,8 +534,29 @@ def _run_verify(args):
         store.close()
 
 
+def _run_checkpoint(args):
+    store = _store(args)
+    try:
+        busy, log_pages, framed = (list(store.checkpoint(truncate=not args.no_truncate))
+                                   + [None, None, None])[:3]
+        out = {"busy": bool(busy), "wal_pages": log_pages, "framed": framed,
+               "truncate": not args.no_truncate, "read_only": store.read_only}
+        out["db_bytes"] = store.info().get("bytes")
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True))
+        elif out["busy"]:
+            print("checkpoint skipped: another connection holds the write lock "
+                  f"(database is {out['db_bytes'] or 0} bytes)")
+        else:
+            print(f"wal checkpointed and {'truncated' if out['truncate'] else 'left as is'}, "
+                  f"database is {out['db_bytes'] or 0} bytes")
+        return 0
+    finally:
+        store.close()
+
+
 def _run_restore(args):
-    store = MemoryStore(args.db, namespace=args.namespace)
+    store = _store(args)
     try:
         record = store.get(args.memory_id)
         if record.state == "active":

@@ -180,10 +180,18 @@ class MemoryFabric:
                          for a in self.export_actions())
 
     def import_actions(self, actions):
-        """Absorb Conflux actions, keeping only this namespace's memory keys."""
+        """Absorb Conflux actions, keeping only this namespace's memory keys.
+
+        A record that is not an action at all is refused by number: an operator
+        replaying a file wants to know which entry is broken, not to read a
+        traceback out of a library that never mentions line numbers.
+        """
         incoming = []
-        for item in actions or ():
-            action = item if isinstance(item, Action) else Action.import_action(item)
+        for number, item in enumerate(actions or (), 1):
+            try:
+                action = item if isinstance(item, Action) else Action.import_action(item)
+            except TypeError as exc:
+                raise ValueError(f"entry {number} is not a Conflux action: {exc}") from exc
             if action.key.startswith(self.prefix):
                 incoming.append(action)
         absorbed = self.replica.absorb(incoming)
@@ -194,7 +202,15 @@ class MemoryFabric:
         return len(absorbed)
 
     def import_journal(self, text):
-        records = [json.loads(line) for line in str(text or "").splitlines() if line.strip()]
+        """Replay a journal file; a line that is not JSON is reported with its number."""
+        records = []
+        for number, line in enumerate(str(text or "").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError as exc:
+                raise ValueError(f"journal line {number} is not JSON: {exc}") from exc
         return self.import_actions(records)
 
     def snapshot(self):

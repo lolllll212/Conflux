@@ -215,23 +215,36 @@ resolves to one UTC instant, fired once.
 ## 9. HTTP service
 
 `python -m conflux.memory serve --db memories.db` (extras: `pip install 'conflux[memory]'`).
-22 routes / 25 operations in five OpenAPI tags, docs at `/docs`; dry-run by
-default everywhere, `{"detail": …}`
-problems, and no CORS unless the operator adds it. Reads are open; writes need
+26 routes / 29 operations in five OpenAPI tags, docs at `/docs`; dry-run by
+default everywhere, errors are `{"detail": …}` problems, and no CORS unless the
+operator adds it. Reads are open; writes need
 `Authorization: Bearer $CONFLUX_MEMORY_TOKEN` when a token is configured (401 +
 `WWW-Authenticate`, never 403, because the caller may retry with credentials).
+Authentication is checked before the body is parsed, so a stranger cannot make
+the service validate a 600-item batch it was never going to accept.
+
+Three response codes are the operational contract rather than decoration:
+`413` for a body over `--max-body-bytes` (1 MiB default, refused before parse),
+`503` + `Retry-After` for anything the store itself reported — `5` when it is
+busy or the volume went read-only, `1` for a lock contention worth retrying,
+`0` when the file will not open at all — and `400` for a request the policy
+refused (a hard delete without the switch, an apply over a stale plan).
+`GET /metrics` is Prometheus text and needs no token: a scraper must be able to
+tell a degraded service from a stopped one.
 
 | Route | Notes |
 | ----- | ----- |
 | `GET /health`, `GET /status`, `GET /safety` | integrity, counts, lock, schedule, the floors in force |
 | `GET/PUT /settings`, `GET /settings/schema`, `POST /settings/reset` | PUT validates and coerces (`"75"` → 75.0); `dry_run:true` previews with `{"valid": false, "errors": [...]}` instead of raising; unknown keys are 400 |
 | `POST /memories` | 201 new, 200 folded; extra keys are 422 (`extra="forbid"`); `on_duplicate` is a documented enum; `ttl_days` or `expires_at` (400 if both, or if `ttl_days <= 0`) |
+| `POST /memories/batch` | up to 500 memories in **one transaction** with per-row receipts: `{written, folded, receipts}`. A batch is not a licence to hide a fold, and half a batch is worse than none |
 | `GET /memories`, `GET /memories/{id}`, `GET …/events`, `POST …/seen`, `POST …/restore` | `state=all` (or empty) means every state; an unknown state is a 400 naming the valid ones, not an empty list |
 | `POST /runs` | `{}` is a dry run; `{"dry_run": false}` mutates; `{"wait": false}` returns at once and the ledger tells the rest; contention is 409 |
 | `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/items`, `POST /runs/{id}/apply` | a dry run's plan stays applicable |
 | `GET /reviews`, `POST /reviews/{id}` | `{decision: approve|reject, note}`; re-deciding a decided review is refused, not repeated |
 | `GET /merges[/{id}]`, `POST /merges/{id}/revert` | `state=open` covers proposed + needs_review |
 | `POST /backups`, `POST /maintenance/purge` | `VACUUM INTO` snapshot; purge needs the hard-delete switch |
+| `POST /maintenance/checkpoint`, `POST /maintenance/events` | fold the WAL; trim observation-only audit rows (`touch`/`seen`/`replay`), dry run by default, and state changes are unreachable through it |
 
 **Claim M14 (the API is thin over the engine).** Every write path funnels
 through `CleanupService`, so the CLI, the scheduler and HTTP cannot disagree —
@@ -254,8 +267,20 @@ python -m conflux.memory settings --db m.db --set stale_after_days=90 --dry-run
 python -m conflux.memory status   --db m.db --json
 python -m conflux.memory verify   --db m.db --mirror --fabric-dir ./fabric
 python -m conflux.memory backup   --db m.db --dest snapshots/m.db
-python -m conflux.memory serve    --db m.db --port 8765
+python -m conflux.memory checkpoint --db m.db             # fold the WAL (add --no-truncate to leave -wal)
+python -m conflux.memory serve    --db m.db --port 8765 \
+                            --durability balanced --max-body-bytes 262144
 ```
+
+`--durability durable|balanced` is a store property, not a policy key: `durable`
+is `synchronous=FULL` (one fsync per commit, the default), `balanced` is `NORMAL`
+(a killed process loses at most the last transactions, a power loss can lose more)
+— and `verify` reports which one the store was *opened* under next to the
+integrity check, the read-only state and any interrupted runs, because
+`synchronous` is a connection setting and a file cannot tell you how its writer
+was configured. `serve` passes the byte budget to uvicorn's own
+header/body limits too, so "refused at 1 MiB" is true before the request is
+buffered, not after.
 
 Exit codes: `0` success, `1` a typed failure (one line on stderr, no traceback),
 `2` a usage error or a run that was refused because another cleanup holds the
@@ -318,8 +343,65 @@ Store-side defaults that are load-bearing and should not be relaxed casually:
 - `serve` is a single-process service: the run lease serializes passes across
   processes, but the HTTP layer adds no authentication beyond the bearer token and
   no rate limiting. Put it behind what you already use.
+- A non-ASCII bearer token cannot survive an HTTP header (headers are decoded as
+  latin-1), so a token with a stray accented character in it is unusable *by
+  construction*; the guard answers 401 for it rather than raising out of a
+  constant-time comparison. Generate tokens with `openssl rand -hex 32`.
+- `compact_events` bounds the audit trail by age and action class only; there is
+  no retention policy engine and no `TTL` on events. A store whose *adds* outpace
+  its compaction still grows.
+- The HTTP budget (`--max-body-bytes`) is per request, and a batch is one request:
+  500 items × 100 000 characters is far over the default 1 MiB, so a client that
+  wants to send a huge batch sends several smaller ones — which is also the
+  behaviour you want after a crash, since each commit is independently durable.
 
-## 14. Where to read next
+## 14. Fault behaviour
+
+Everything above is about what a pass *does*; this section is about what happens
+when the box, the disk or the client misbehaves. The rule throughout: a fault is
+classified, counted and recoverable, and nothing already committed is lost.
+
+| Situation | Behaviour |
+| --------- | --------- |
+| process killed mid-write | SQLite replays its own journal; no committed row is lost. A run left `running` by a dead process is reaped on the next start and its ledger row reads `aborted` — it does not pretend to have finished |
+| volume mounted read-only | the store reopens `file:…?mode=ro&immutable=1`, sets `read_only`, and says so in `info()`; reads serve, writes raise `StoreUnavailable`, HTTP answers 503, and the scheduler stays down instead of retrying into a log |
+| disk full, `SQLITE_BUSY`, locked by another process | `classify_sqlite` maps each to a type with the retry hint that is true for it (`Retry-After: 5`, `1`, `0`); nothing retries in a tight loop |
+| the file will not open / fails `PRAGMA integrity_check` | `StoreCorrupt` — reported, never silently recreated; `GET /health` carries the check output |
+| a body with a sliced emoji, control characters, or 12 MB of text | U+FFFD substitution (a lone surrogate is a client bug, not a server error), a named refusal for characters SQLite would silently truncate, and 413 before parsing for size |
+| two processes cleaning at once | the `run_lock` lease refuses the second one with 409; a lease whose owner died expires and is recorded |
+| audit trail growth | reads and re-statements are most of `memory_events`; `POST /maintenance/events` trims exactly `touch`/`seen`/`replay`, older than N days, dry run first, and writes an `events_compacted` row into the trail it trims |
+| restart after a long session | `close()` folds the WAL (best-effort: a failure there is logged, never raised out of a shutdown), and `checkpoint --truncate` does it on demand |
+
+**Claim M17 (a batch is one commit and one decision).** `add_many` /
+`POST /memories/batch` write N memories under a single transaction, so an agent
+recording 200 facts pays one fsync and gets all-or-nothing durability; every row
+still returns its own receipt, so batching never conceals a fold. Measured on this
+box with `durability=durable`: 1.08 ms per single write vs 0.22 ms per write in a
+batch of 200. The gap is fsync latency, so re-measure on your disk — the point is
+that the batch path does one commit, not that this machine is fast.
+— `tests/test_memory_faults.py`
+
+**Claim M18 (compaction cannot rewrite history).** `compact_events` deletes only
+rows whose action is in its drop list, whose default is `touch`/`seen`/`replay`;
+an empty list is refused, a cutoff must be in the past, dry run is the default,
+and the rows that changed a memory's state are not reachable through it. —
+`tests/test_memory_faults.py`
+
+**Claim M19 (degradation is a mode, not a crash).** The read-only, busy,
+disk-full and corrupt cases are four types with four answers, all of them
+observable without a traceback: `info()`/`health()` report `read_only`,
+`degraded` and `durability`, HTTP answers 503 with a `Retry-After`, and the
+scheduler refuses to fire rather than spinning. — `tests/test_memory_faults.py`
+
+**Claim M20 (the wire in front of the store is supervised too).** Every frame
+a peer or agent can send — oversized, non-UTF-8, non-object, over-deep,
+truncated, or one that asks for more work than `max_actions_per_frame` — is
+refused before it touches state, counted, and answered; per-link state is a
+journal cursor, so a 20 000-action journal gossips at the cost of what it
+delivered. — `tests/test_fault_transport.py`, `docs/PROTOCOL.md` §6,
+`docs/SECURITY.md` S7–S8
+
+## 15. Where to read next
 
 - `examples/self_pruning_memory_demo.py` — the whole story in one file,
   asserted by `tests/test_demos.py`.

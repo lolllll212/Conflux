@@ -13,6 +13,7 @@ is started:
 """
 
 import logging
+import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
@@ -20,7 +21,7 @@ from contextlib import contextmanager
 from .cleanup import CleanupEngine
 from .model import build_model
 from .policy import CleanupPolicy
-from .store import MemoryStore, RunInProgress, iso, utcnow
+from .store import MemoryStore, RunInProgress, StoreError, iso, utcnow
 
 log = logging.getLogger("conflux.memory.service")
 
@@ -32,10 +33,13 @@ class CleanupService:
 
     def __init__(self, db_path=None, *, store=None, namespace="default", policy=None, model=None,
                  lease_seconds=DEFAULT_LEASE_SECONDS, scheduler=None, logger=None,
-                 backup_dir=None):
+                 backup_dir=None, durability="durable", read_only="auto"):
         if store is None and not db_path:
             raise ValueError("CleanupService needs a db_path or a store")
-        self.store = store or MemoryStore(db_path, namespace=namespace)
+        # durability and the read-only fallback describe the *volume*, not the
+        # cleanup rules, so they are constructor arguments and never policy keys
+        self.store = store or MemoryStore(db_path, namespace=namespace, durability=durability,
+                                          read_only=read_only)
         self.namespace = self.store.namespace
         self.backup_dir = backup_dir
         self.lease_seconds = float(lease_seconds)
@@ -136,8 +140,27 @@ class CleanupService:
     def run(self, *, dry_run=True, trigger="manual", actor=None, force=False, limit=None):
         """One cleanup pass under an exclusive lease. Raises ``RunInProgress``."""
         with self._exclusive(trigger=trigger, actor=actor) as owner:
-            return self.engine().run(dry_run=dry_run, trigger=trigger, namespace=self.namespace,
-                                     actor=actor or f"{trigger}:{owner}", force=force, limit=limit)
+            report = self.engine().run(dry_run=dry_run, trigger=trigger, namespace=self.namespace,
+                                       actor=actor or f"{trigger}:{owner}", force=force, limit=limit)
+            if not dry_run:
+                self.checkpoint()
+            return report
+
+    def checkpoint(self, *, truncate=True):
+        """Fold the write-ahead log back into the main database file.
+
+        WAL only grows while nothing checkpoints it, so a long-lived service that
+        never checkpoints ends up with a -wal file larger than the database and a
+        slow open after a crash. Best-effort by design: a busy log is not a reason
+        to fail the pass that just succeeded.
+        """
+        try:
+            busy, log_size, framed = self.store.checkpoint(truncate=truncate)
+        except (StoreError, sqlite3.Error) as exc:
+            self.log.warning("wal checkpoint skipped: %s", exc)
+            return {"skipped": True, "reason": str(exc)}
+        return {"skipped": False, "busy": bool(busy), "wal_pages": log_size, "framed": framed,
+                "truncate": truncate}
 
     def start_run_async(self, *, dry_run=True, trigger="manual", actor=None, force=False):
         """Kick a pass off in a worker thread; the caller polls ``/runs``.
@@ -208,10 +231,32 @@ class CleanupService:
         except Exception:
             writable = False
         scheduler = self.scheduler_status()
+        info = self.store.info()
+        counts = self.store.counts(namespace=self.namespace)
+        wal = 0
+        try:
+            import os
+            wal = os.path.getsize(self.store.path + "-wal") if os.path.exists(
+                self.store.path + "-wal") else 0
+        except OSError:
+            pass
+        degraded_reason = None
+        if not writable:
+            degraded_reason = (self.store.degraded or "the database rejected a test write")
+        elif integrity != ["ok"]:
+            degraded_reason = "integrity_check reported: " + "; ".join(integrity[:3])
         return {"status": "ok" if integrity == ["ok"] and writable else "degraded",
+                "degraded_reason": degraded_reason,
+                "read_only": bool(info.get("read_only")),
+                "durability": info.get("durability"),
+                "interrupted_runs": len(getattr(self.store, "interrupted_runs", ()) or ()),
+                "bytes": info.get("bytes"), "wal_bytes": wal,
+                "rows": counts.get("total"), "reviews_open": counts.get("open_reviews"),
+                "merges_proposed": counts.get("proposed_merges"),
                 "integrity": integrity, "writable": writable,
                 "schema_version": self.store.schema_version,
-                "latest_schema_version": self.store.info()["latest_schema_version"],
+                "latest_schema_version": info["latest_schema_version"],
+                "schema_version_stale": info["schema_version"] != info["latest_schema_version"],
                 "namespace": self.namespace, "server_time": iso(utcnow()),
                 "running": bool(self.store.lock_info(self.namespace).get("held")),
                 "scheduler": {k: scheduler.get(k) for k in
@@ -255,4 +300,11 @@ class CleanupService:
         self.store.close()
 
     def close(self):
+        # fold the WAL on the way out, so the next start reads one file instead of
+        # replaying a log: the difference between a fast restart and a surprising one
+        try:
+            if not self.store.read_only:
+                self.store.checkpoint(truncate=True)
+        except (StoreError, sqlite3.Error) as exc:
+            self.log.info("shutdown checkpoint skipped: %s", exc)
         self.stop()

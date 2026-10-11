@@ -17,16 +17,21 @@ Safety properties the rest of the package relies on:
 """
 
 import json
+import logging
+import re
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from .policy import CleanupPolicy
 from .schema import PRAGMAS, apply_migrations, SCHEMA_VERSION, user_version
 from .similar import (content_fingerprint, normalize_text, pack_vector, signature, unpack_vector)
+
+log = logging.getLogger("conflux.memory.store")
 
 ACTIVE = "active"
 STATES = (ACTIVE, "merged", "pruned", "superseded", "archived")
@@ -197,12 +202,124 @@ class RunInProgress(StoreError):
     """Raised when a cleanup run cannot take the exclusive lease."""
 
 
+class StoreUnavailable(StoreError):
+    """The file and the data are fine; the *environment* is not.
+
+    Disk full, a read-only mount, an I/O error, or another writer still holding a
+    lock. Callers should treat this as "later" (HTTP 503, retry with backoff),
+    never as "your request was wrong" - and an operator should look at the box,
+    not at the query.
+    """
+
+
+class StoreBusy(StoreUnavailable):
+    """Another connection held the write lock past our busy_timeout."""
+
+
+class StoreCorrupt(StoreError):
+    """The file is damaged, encrypted or not a database at all: restore a backup."""
+
+
 class PolicyViolation(StoreError):
     """A mutation was refused by a safety guard."""
 
 
 class PlanStale(StoreError):
     """A plan's target row changed after planning; the step is skipped, not guessed."""
+
+
+# --- sqlite error classification --------------------------------------------
+
+# What each class of failure means to a caller, decided by the words SQLite uses.
+# Matching text is imperfect, but the cost of a misclassification is only a
+# slightly wrong retry hint - never lost data and never a silent success.
+_BUSY_MARKERS = ("database is locked", "database table is locked")
+_UNAVAILABLE_MARKERS = (
+    "disk i/o error", "disk is full", "disk quota", "readonly database",
+    "read-only file system", "unable to open database file", "attempt to write",
+    "no space left on device", "too many connections", "unable to open",
+)
+_CORRUPT_MARKERS = ("malformed", "file is not a database", "not a database",
+                   "file is encrypted", "file is not a database")
+
+
+def classify_sqlite(exc):
+    """Wrap a raw ``sqlite3`` error in the one exception type that says what to do.
+
+    A full disk and a bad ``WHERE`` clause both arrive as ``OperationalError`` from
+    Python's point of view; to an operator they are completely different incidents,
+    and a client should retry one and not the other.
+    """
+    if not isinstance(exc, sqlite3.Error) or isinstance(exc, sqlite3.ProgrammingError):
+        return exc
+    text = str(exc).casefold()
+    if any(marker in text for marker in _CORRUPT_MARKERS):
+        return StoreCorrupt(f"{exc} - the database file needs a restore from backup "
+                            f"(verify with: python -m conflux.memory verify --db <path>)")
+    if any(marker in text for marker in _BUSY_MARKERS):
+        return StoreBusy(f"{exc} - another writer holds the lock; retry shortly")
+    if any(marker in text for marker in _UNAVAILABLE_MARKERS):
+        return StoreUnavailable(
+            f"{exc} - the store cannot be written right now (full or read-only volume, "
+            f"or an unreadable path); committed data is unaffected")
+    return exc
+
+
+# --- text safety ------------------------------------------------------------
+
+# C17: a lone surrogate is a perfectly good Python string and a perfectly bad
+# SQLite TEXT value - the driver raises UnicodeEncodeError while binding it, which
+# would surface as an unhandled 500 for any client that sliced a string in the
+# middle of an emoji. Substitute instead of losing the write.
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+MAX_BODY_CHARS = 100_000
+MAX_JSON_CHARS = 64_000  # metadata / provenance, once serialised
+
+
+def sanitize_text(value, *, field_name="text", limit=None):
+    """Return a UTF-8-encodable, control-character-free version of ``value``.
+
+    Raises rather than silently rewriting only when what is left would be a
+    different fact (an embedded NUL, or a body that is entirely unprintable).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", "replace")
+    text = value if isinstance(value, str) else str(value)
+    bad = _CONTROL_RE.search(text)
+    if bad:
+        raise ValueError(f"{field_name} must not contain control characters "
+                         f"(found U+{ord(bad.group()):04X}); strip them before writing")
+    if _LONE_SURROGATE_RE.search(text):
+        text = _LONE_SURROGATE_RE.sub("\ufffd", text)
+    text = text.strip()
+    if limit is not None and len(text) > limit:
+        raise ValueError(f"{field_name} too long (max {limit} chars, got {len(text)})")
+    return text
+
+
+def _check_json_blob(name, obj, limit=MAX_JSON_CHARS):
+    """Serialise a metadata/provenance mapping and bound its size."""
+    text = _dumps(obj)
+    if len(text) > limit:
+        raise ValueError(f"{name} too large ({len(text)} chars serialised, max {limit}); "
+                         f"store the payload elsewhere and keep a uri here")
+    return text
+
+
+def _actionable(problem, path):
+    """Give an open-time failure a message that says what to look at next."""
+    if isinstance(problem, StoreUnavailable):
+        return StoreUnavailable(
+            f"cannot open {path} for writing: {problem}. Check the volume (df -h), the mount "
+            f"options and file ownership; an already-migrated database can still be read with "
+            f"read_only=True")
+    if isinstance(problem, StoreError):
+        return problem
+    return StoreError(f"cannot open the memory database at {path}: {problem}")
 
 
 # --- store ------------------------------------------------------------------
@@ -217,25 +334,148 @@ class MemoryStore:
     here already does.
     """
 
-    def __init__(self, path, namespace="default", *, timeout=30.0, create=True):
+    def __init__(self, path, namespace="default", *, timeout=30.0, create=True,
+                 durability="durable", read_only="auto", interrupt="reap"):
+        """Open the store.
+
+        ``durability``
+            ``"durable"`` (default) sets ``synchronous=FULL``: every commit is on
+            disk before it is acknowledged, which is what a memory layer wants
+            because a lost write is a lost fact. ``"balanced"`` uses
+            ``synchronous=NORMAL``, still crash-safe for a process that dies but
+            not for a machine that loses power, and roughly 5x the throughput.
+        ``read_only``
+            ``"auto"`` (default) degrades instead of dying: if the volume cannot be
+            written (full disk, read-only remount), an existing, already-migrated
+            database opens read-only, reads keep working, and every write raises
+            :class:`StoreUnavailable`. Pass ``False`` to fail at open instead.
+        ``interrupt``
+            ``"reap"`` marks runs left ``running`` by a process that died as
+            ``aborted`` - but only while no live lease names them, so a pass
+            happening right now in another process is never touched.
+        """
+        import os
+
         self.path = str(path)
         self.namespace = namespace or "default"
         self._lock = threading.RLock()
         self._depth = 0
+        self.read_only = False
+        self.degraded = None
+        self.interrupted_runs = ()
+        self.durability = durability if durability in ("durable", "balanced") else "durable"
         if not create and self.path != ":memory:" and not self.path.startswith("file:"):
-            import os
             if not os.path.exists(self.path):
                 raise FileNotFoundError(f"no memory database at {self.path}")
-        self._conn = sqlite3.connect(self.path, timeout=timeout, isolation_level=None,
-                                     check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self.immutable = False
+        self._connect(timeout)
         try:
-            for pragma in PRAGMAS:
-                self._conn.execute(pragma)
-            apply_migrations(self._conn)
-        except Exception:
-            self._conn.close()
-            raise
+            self._configure(timeout=timeout)
+        except (StoreUnavailable, StoreCorrupt, sqlite3.Error) as exc:
+            problem = classify_sqlite(exc)
+            if not isinstance(problem, StoreUnavailable) or read_only is False:
+                raise _actionable(problem, self.path) from exc
+            if not os.path.exists(self.path):
+                # a database we were asked to create that we cannot create is a hard
+                # failure; opening "read-only" here would hide a misconfigured volume
+                raise _actionable(problem, self.path) from exc
+            self._open_read_only(timeout, problem)
+        try:
+            if not self.read_only and interrupt == "reap":
+                self.interrupted_runs = self.reap_interrupted_runs()
+        except (StoreError, sqlite3.Error):
+            # recovery bookkeeping must never be the reason a store fails to open
+            self.interrupted_runs = ()
+
+    def _connect(self, timeout, *, target=None):
+        """Open the raw connection, with sqlite's own failures given a path to name.
+
+        A typo in ``--db`` and a full volume both look like "unable to open database
+        file" to sqlite3; the operator needs the path either way, so it goes in.
+        """
+        try:
+            self._conn = sqlite3.connect(target or self.path, timeout=timeout,
+                                         isolation_level=None, check_same_thread=False)
+        except (sqlite3.Error, OSError) as exc:
+            problem = classify_sqlite(exc)
+            raise _actionable(problem if isinstance(problem, StoreError)
+                              else StoreUnavailable(str(exc)), self.path) from exc
+        self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def _open_read_only(self, timeout, problem):
+        """Keep reads alive when the volume refuses writes - and say which mode won.
+
+        Two ways to arrive here, and SQLite treats them differently: a read-only
+        *file* in a writable directory can still get its -shm and -wal sidecars, so a
+        plain read-only open works; a read-only *volume* cannot, and the only way to
+        read a WAL-mode database then is to declare it immutable - correct for a
+        snapshot or a cold file, and stated loudly because it means "do not expect
+        this process to see anyone else's writes".
+        """
+        attempts = []
+        for immutable in (False, True):
+            try:
+                self._conn.close()
+            except (sqlite3.Error, AttributeError):
+                pass
+            if self.path.startswith("file:") or self.path == ":memory:":
+                target = self.path  # already a URI or in-memory: nothing to downgrade to
+            else:
+                target = "file:%s?mode=ro" % quote(self.path)
+                if immutable:
+                    target += "&immutable=1"
+            try:
+                self._connect(timeout, target=target)
+                self._prepare_read_only()
+            except (sqlite3.Error, StoreError) as inner:
+                attempts.append(f"{'immutable' if immutable else 'query_only'}: {inner}")
+                continue
+            self.read_only = True
+            self.immutable = immutable
+            # the cause is one clause long on purpose: this string ends up in a
+            # health payload and a log line, not in a stack trace
+            self.degraded = ("the database is not writable; opened read-only (cause: %s)%s"
+                             % (str(problem).split(" - ")[0],
+                                ", assuming the file does not change underneath us"
+                                if immutable else ""))
+            log.warning("%s", self.degraded)
+            return
+        raise _actionable(StoreUnavailable(
+            f"{problem}; even a read-only open failed ({'; '.join(attempts)})"), self.path)
+
+    def _prepare_read_only(self):
+        """What a read-only connection must prove before the service trusts it."""
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        if not self.immutable:
+            self._conn.execute("PRAGMA query_only=ON")
+        version = user_version(self._conn)
+        if version != SCHEMA_VERSION:
+            # reading an old schema with new code is how a quiet corruption bug
+            # becomes a loud one: refuse, and say what to do instead
+            raise StoreUnavailable(
+                f"schema v{version} needs migrating to v{SCHEMA_VERSION} but the file is not "
+                f"writable; restore a backup, make the volume writable, or run the "
+                f"migration on a copy")
+        # and the tables have to actually be there: an empty file that cannot be
+        # migrated is not a memory store, and serving it would look like data loss
+        self._conn.execute("SELECT count(*) FROM memories").fetchone()
+
+    def _configure(self, timeout):
+        """Pragmas + migrations, with the write-dependent ones isolated."""
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        # an unbounded -wal file is a classic slow leak on a long-lived service
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA journal_size_limit=67108864")
+        self._conn.execute("PRAGMA synchronous=%s"
+                           % ("FULL" if self.durability == "durable" else "NORMAL"))
+        apply_migrations(self._conn)
+
+    def _writable_or_raise(self, what="write"):
+        if self.read_only:
+            raise StoreUnavailable(f"cannot {what}: {self.degraded or 'the database is read-only'}")
+
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -286,23 +526,51 @@ class MemoryStore:
                     self._conn.execute(f"RELEASE {name}")
                     self._depth -= 1
                 return
-            self._conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN DEFERRED")
-            self._depth += 1
+            if immediate:
+                self._writable_or_raise()
+            try:
+                self._raw("BEGIN IMMEDIATE" if immediate else "BEGIN DEFERRED")
+                self._depth += 1
+            except Exception:
+                raise
             try:
                 yield self._conn
             except Exception:
-                self._conn.execute("ROLLBACK")
                 self._depth -= 1
+                try:
+                    self._raw("ROLLBACK")
+                except Exception:
+                    # a failed rollback means the transaction is still open: keep the
+                    # depth honest so the next caller does not nest into a dead txn
+                    pass
                 raise
-            self._conn.execute("COMMIT")
             self._depth -= 1
+            try:
+                self._raw("COMMIT")
+            except StoreUnavailable:
+                # a commit that fails on a full disk leaves the transaction open
+                try:
+                    self._raw("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    def _raw(self, sql, params=()):
+        """One statement, with sqlite's failures translated into our taxonomy."""
+        try:
+            return self._conn.execute(sql, params)
+        except sqlite3.Error as exc:
+            problem = classify_sqlite(exc)
+            if problem is exc:
+                raise
+            raise problem from exc
 
     def _execute(self, sql, params=()):
-        return self._conn.execute(sql, params)
+        return self._raw(sql, params)
 
     def query(self, sql, params=()):
         with self._lock:
-            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+            return [dict(r) for r in self._raw(sql, params).fetchall()]
 
     def query_one(self, sql, params=()):
         rows = self.query(sql, params)
@@ -328,11 +596,22 @@ class MemoryStore:
         ``created=False``. ``"insert"`` keeps both rows for the cleanup pass to
         reason about; ``"error"`` raises :class:`DuplicateMemory`.
         """
-        clean = str(body or "").strip()
+        # every client-supplied string goes through sanitize_text first: a lone
+        # surrogate (a sliced emoji) or an embedded NUL would otherwise blow up the
+        # utf-8 encoding the sqlite3 driver does while *binding* the parameter,
+        # which is a 500 in an HTTP process rather than a rejected write
+        clean = sanitize_text(body, field_name="memory body")
         if not clean:
             raise ValueError("memory body must not be empty")
-        if len(clean) > 100_000:
-            raise ValueError("memory body too long (max 100000 chars)")
+        if len(clean) > MAX_BODY_CHARS:
+            raise ValueError(f"memory body too long (max {MAX_BODY_CHARS} chars)")
+        kind = sanitize_text(kind, field_name="kind") or "note"
+        topic = sanitize_text(topic, field_name="topic") if topic is not None else None
+        source_agent = (sanitize_text(source_agent, field_name="source agent")
+                        if source_agent is not None else None)
+        uri = sanitize_text(uri, field_name="uri") if uri is not None else None
+        idempotency_key = (sanitize_text(idempotency_key, field_name="idempotency key")
+                           if idempotency_key is not None else None)
         if on_duplicate not in ("touch", "insert", "error"):
             # refuse loudly instead of silently behaving like "insert"
             raise ValueError("on_duplicate must be one of 'touch', 'insert', 'error', "
@@ -407,7 +686,8 @@ class MemoryStore:
             for name, value in (
                 ("id", memory_id), ("namespace", ns), ("kind", kind or "note"), ("topic", topic),
                 ("body", clean), ("body_norm", norm), ("fingerprint", fp),
-                ("metadata", _dumps(dict(metadata or {}))), ("provenance", _dumps(prov)),
+                ("metadata", _check_json_blob("metadata", metadata)),
+                ("provenance", _check_json_blob("provenance", prov)),
                 ("source_agent", source_agent), ("uri", uri), ("confidence", confidence),
                 ("importance", float(importance)), ("embedding", vector_blob),
                 ("embedding_model", embedding_model if embedding is not None else None),
@@ -435,6 +715,64 @@ class MemoryStore:
                     "duplicate_of": [r["id"] for r in exact] if exact else [],
                     "fingerprint": fp, "revision": 1}
 
+    def add_many(self, rows, *, namespace=None, actor=None, run_id=None):
+        """Write many memories in one transaction: one fsync instead of one per row.
+
+        ``rows`` is a list of body strings or mappings carrying ``body`` plus any
+        :meth:`add` field. The batch commits together, so an agent recording 200
+        facts after a session either has all of them or none - and each row's receipt
+        still says whether it folded into an existing memory, because a batch is not a
+        licence to swallow an exact duplicate quietly.
+        """
+        if not rows:
+            return []
+        receipts = []
+        with self.transaction():
+            for row in rows:
+                if isinstance(row, str):
+                    body, fields = row, {}
+                elif isinstance(row, dict):
+                    body = row.get("body")
+                    fields = {k: v for k, v in row.items() if k not in ("body", "namespace")}
+                else:
+                    raise ValueError("add_many rows must be a body string or a mapping with 'body'")
+                if not body:
+                    raise ValueError("add_many row is missing a body")
+                fields.setdefault("actor", actor or "agent")
+                receipts.append(self.add(body, namespace=namespace, run_id=run_id, **fields))
+        return receipts
+
+    def compact_events(self, *, older_than, drop_actions=("touch", "seen", "replay"),
+                       namespace=None, dry_run=True):
+        """Trim the observation-only audit rows; state changes are never trimmed.
+
+        ``touch``/``seen``/``replay`` record that a memory was re-stated or read and
+        repeat text the surviving row already holds, so on a busy store they are most
+        of the table and say nothing a state change does not. Every other action
+        (add, update, state:*, merge_*, run_*, hard_delete) is permanent: an audit
+        trail you can quietly rewrite is not an audit trail.
+        """
+        ns = namespace or self.namespace
+        cutoff = older_than if isinstance(older_than, str) else iso(older_than)
+        marks = list(drop_actions)
+        if not marks:
+            raise ValueError("compact_events needs at least one action to drop")
+        placeholders = ",".join("?" for _ in marks)
+        where = f"WHERE namespace=? AND ts<? AND action IN ({placeholders})"
+        matched = self.query_one(f"SELECT COUNT(*) AS n FROM memory_events {where}",
+                                 (ns, cutoff, *marks))
+        total = self.query_one("SELECT COUNT(*) AS n FROM memory_events WHERE namespace=?", (ns,))
+        result = {"namespace": ns, "older_than": cutoff, "droppable": marks,
+                  "candidates": (matched or {}).get("n", 0),
+                  "events_total": (total or {}).get("n"), "dry_run": dry_run, "deleted": 0,
+                  "note": "rows that changed a memory's state are never deleted here"}
+        if dry_run or not result["candidates"]:
+            return result
+        with self.transaction():
+            cur = self._execute(f"DELETE FROM memory_events {where}", (ns, cutoff, *marks))
+            result["deleted"] = cur.rowcount
+        return result
+
     def get(self, memory_id, *, namespace=None, with_vector=True):
         ns = namespace or self.namespace
         row = self._execute("SELECT * FROM memories WHERE namespace=? AND id=?", (ns, memory_id)).fetchone()
@@ -454,28 +792,94 @@ class MemoryStore:
         return [Memory.from_row(r, with_vector=with_vector) for r in rows]
 
     def list(self, *, state=ACTIVE, kind=None, topic=None, namespace=None, limit=100, offset=0,
-             updated_since=None, with_vector=False, order="updated_at"):
-        """Page over memories; ``state=None`` returns every state."""
+             updated_since=None, with_vector=False, order="updated_at", q=None):
+        """Page over memories; ``state=None`` returns every state.
+
+        ``q`` is a substring filter evaluated *in SQL*, before paging. It used to
+        run over the already-limited page in Python, so ``?q=x&limit=5`` could
+        answer "no matches" while the store held hundreds - a silent wrong answer
+        for any client that pages. Matching is ASCII case-insensitive
+        (``lower(col) LIKE ?``); ``%`` and ``_`` in the needle are literal.
+        """
+        where, params = self._list_filters(state=state, kind=kind, topic=topic,
+                                           namespace=namespace, updated_since=updated_since,
+                                           q=q)
+        order = order if order in ("updated_at", "created_at", "id") else "updated_at"
+        sql = f"SELECT * FROM memories {where} ORDER BY {order} DESC, id ASC LIMIT ? OFFSET ?"
+        rows = self._execute(sql, [*params, int(limit), int(offset)]).fetchall()
+        return [Memory.from_row(r, with_vector=with_vector) for r in rows]
+
+    def _list_filters(self, *, state, kind, topic, namespace, updated_since, q):
         ns = namespace or self.namespace
-        sql = ["SELECT * FROM memories WHERE namespace=?", ]
+        where = ["WHERE namespace=?"]
         params = [ns]
         if state is not None:
-            sql.append("AND state=?")
+            where.append("AND state=?")
             params.append(state)
         if kind is not None:
-            sql.append("AND kind=?")
+            where.append("AND kind=?")
             params.append(kind)
         if topic is not None:
-            sql.append("AND topic=?")
+            where.append("AND topic=?")
             params.append(topic)
         if updated_since is not None:
-            sql.append("AND updated_at>?")
+            where.append("AND updated_at>?")
             params.append(iso(updated_since))
-        order = order if order in ("updated_at", "created_at", "id") else "updated_at"
-        sql.append(f"ORDER BY {order} DESC, id ASC LIMIT ? OFFSET ?")
-        params.extend([int(limit), int(offset)])
-        rows = self._execute(" ".join(sql), params).fetchall()
-        return [Memory.from_row(r, with_vector=with_vector) for r in rows]
+        if q is not None:
+            needle = sanitize_text(q, field_name="q")
+            if needle:
+                # wildcards in a needle are literal characters, not operators
+                escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                where.append("AND (lower(body) LIKE ? ESCAPE '\\' OR lower(topic) LIKE ? "
+                             "ESCAPE '\\')")
+                params += [f"%{escaped.casefold()}%", f"%{escaped.casefold()}%"]
+        return " ".join(where).replace("WHERE AND ", "WHERE "), params
+
+    def count(self, *, state=ACTIVE, kind=None, topic=None, namespace=None,
+              updated_since=None, q=None):
+        """How many memories a filter matches, independent of paging."""
+        where, params = self._list_filters(state=state, kind=kind, topic=topic,
+                                           namespace=namespace, updated_since=updated_since,
+                                           q=q)
+        row = self._execute(f"SELECT COUNT(*) AS n FROM memories {where}", params).fetchone()
+        return int(row["n"]) if row else 0
+
+    def reap_interrupted_runs(self, *, namespace=None):
+        """Mark runs a dead process left ``running`` as ``aborted``.
+
+        A pass killed mid-apply is survivable by construction - each cluster is its
+        own transaction, and re-applying the plan revalidates row by row - but the
+        ledger would keep saying ``running`` forever, and "running" is precisely what
+        an operator reads at 3am. A run that a *live* lease still names is left
+        alone, so this never interrupts a pass happening in another process.
+        """
+        ns = namespace or self.namespace
+        rows = self._execute("SELECT id, started_at, actor, mode, trigger FROM runs "
+                             "WHERE namespace=? AND status='running' ORDER BY started_at",
+                             (ns,)).fetchall()
+        if not rows:
+            return ()
+        held = self._execute("SELECT run_id FROM run_lock WHERE namespace=? AND lease_expires_at>?",
+                             (ns, iso(utcnow()))).fetchall()
+        live = {r["run_id"] for r in held if r["run_id"]}
+        reaped = []
+        for row in rows:
+            if row["id"] in live:
+                continue
+            with self.transaction():
+                cur = self._execute(
+                    "UPDATE runs SET status='aborted', finished_at=?, error=? "
+                    "WHERE namespace=? AND id=? AND status='running'",
+                    (iso(utcnow()), "the process holding this run exited before it finished; "
+                     "clusters already committed stay applied, the rest were never written",
+                     ns, row["id"]))
+                if cur.rowcount:
+                    self._event("run_aborted", namespace=ns, target=row["id"], run_id=row["id"],
+                                actor="recovery",
+                                detail={"started_at": row["started_at"], "mode": row["mode"],
+                                        "trigger": row["trigger"], "actor": row["actor"]})
+                    reaped.append(row["id"])
+        return tuple(reaped)
 
     def active(self, *, namespace=None, limit=10000, with_vector=False):
         return self.list(state=ACTIVE, namespace=namespace, limit=limit, with_vector=with_vector)
@@ -526,9 +930,11 @@ class MemoryStore:
         sets, params = ["updated_at=?"], [iso(utcnow())]
         snapshot = {}
         if body is not None:
-            clean = str(body).strip()
+            clean = sanitize_text(body, field_name="memory body")
             if not clean:
                 raise ValueError("memory body must not be empty")
+            if len(clean) > MAX_BODY_CHARS:
+                raise ValueError(f"memory body too long (max {MAX_BODY_CHARS} chars)")
             row = self.get(memory_id, namespace=ns)
             sets += ["body=?", "body_norm=?", "fingerprint=?", "revision=revision+1"]
             params += [clean, normalize_text(clean), content_fingerprint(clean, kind or row.kind,
@@ -700,6 +1106,10 @@ class MemoryStore:
         queryable projection so a memory's merge history can be walked later.
         """
         ns = namespace or self.namespace
+        # a model's output is untrusted input: it may contain anything, and a
+        # proposal that cannot be written must fail before the transaction opens
+        merged_body = sanitize_text(merged_body, field_name="merged body",
+                                    limit=MAX_BODY_CHARS)
         merged_norm = normalize_text(merged_body)
         with self.transaction():
             existing = self.find_open_merge(cluster_key, namespace=ns)
@@ -1219,16 +1629,37 @@ class MemoryStore:
             self._conn.execute("VACUUM INTO ?", (str(destination),))
         return str(destination)
 
-    def checkpoint(self):
+    def checkpoint(self, *, truncate=True):
+        """Fold the write-ahead log into the main database file.
+
+        A WAL is only bounded by somebody checkpointing it, so a long-lived service
+        that never does ends up with a -wal file bigger than the database and a slow,
+        surprising open after a crash. Returns ``(busy, log_pages, framed_pages)``;
+        ``busy`` means another connection held the lock and nothing was lost by
+        skipping - the next checkpoint will do it.
+        """
         with self._lock:
-            return self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            row = self._execute("PRAGMA wal_checkpoint(%s)"
+                                % ("TRUNCATE" if truncate else "PASSIVE")).fetchone()
+        return tuple(row) if row else (None, None, None)
 
     def info(self):
         row = self._execute("PRAGMA page_count").fetchone()
         free = self._execute("PRAGMA freelist_count").fetchone()
-        return {"path": self.path, "namespace": self.namespace, "schema_version": self.schema_version,
-                "latest_schema_version": SCHEMA_VERSION, "pages": row[0] if row else None,
-                "free_pages": free[0] if free else None, "states": STATES}
+        out = {"path": self.path, "namespace": self.namespace, "schema_version": self.schema_version,
+               "latest_schema_version": SCHEMA_VERSION, "pages": row[0] if row else None,
+               "free_pages": free[0] if free else None, "states": STATES,
+               "read_only": self.read_only, "durability": self.durability,
+               "immutable_read_only": self.immutable}
+        if self.degraded:
+            out["degraded"] = self.degraded
+        if not self.read_only:
+            # size telemetry belongs next to the path it describes: an operator
+            # deciding whether to back up or to shrink looks at both at once
+            pages = self._execute("PRAGMA page_count").fetchone()
+            out["page_size"] = self._execute("PRAGMA page_size").fetchone()[0]
+            out["bytes"] = pages[0] * out["page_size"] if pages else None
+        return out
 
 
 def _union_provenance(existing, incoming):

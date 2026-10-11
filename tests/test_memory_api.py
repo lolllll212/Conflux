@@ -76,10 +76,15 @@ def test_health_reports_integrity_and_schema(client):
 def test_openapi_documents_every_route(client):
     schema = client.get("/openapi.json").json()
     paths = schema["paths"]
-    assert len(paths) == 22, sorted(paths)
-    for path in ("/memories", "/runs", "/runs/{run_id}/apply", "/reviews/{review_id}", "/settings",
-                 "/safety", "/maintenance/purge", "/backups", "/merges/{merge_id}/revert"):
+    assert len(paths) == 26, sorted(paths)
+    for path in ("/memories", "/memories/batch", "/runs", "/runs/{run_id}/apply",
+                 "/reviews/{review_id}", "/settings", "/safety", "/maintenance/purge",
+                 "/maintenance/events", "/maintenance/checkpoint", "/metrics", "/backups",
+                 "/merges/{merge_id}/revert"):
         assert path in paths, path
+    # the operational surface must stay readable without the write token, or a
+    # scraper cannot tell a degraded service from a stopped one
+    assert "get" in paths["/metrics"] and "get" in paths["/health"]
     assert "Nothing leaves this machine" in schema["info"]["description"]
     # write paths carry the bearer security hint through the guard dependency
     assert paths["/runs"]["post"]["responses"]["422"]
