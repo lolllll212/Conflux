@@ -30,9 +30,11 @@ from .validate import (
     verify_action,
 )
 from .websocket import WebSocket, WSMessenger, WebSocketServer, connect_websocket
-from . import integrations
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
+
+from .mcp import ConfluxMCPServer, MCP_TOOLS
+from . import integrations
 
 __all__ = [
     "Action",
@@ -83,5 +85,7 @@ __all__ = [
     "WSMessenger",
     "WebSocketServer",
     "connect_websocket",
+    "ConfluxMCPServer",
+    "MCP_TOOLS",
     "integrations",
 ]

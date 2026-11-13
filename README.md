@@ -2,6 +2,8 @@
 
 [![PyPI](https://img.shields.io/pypi/v/conflux-state.svg)](https://pypi.org/project/conflux-state/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lolllll212/Conflux/blob/master/examples/quickstart_colab.ipynb)
+[![MCP Ready](https://img.shields.io/badge/MCP-conflux--mcp-purple.svg)](#mcp-server-claude-code-cursor-windsurf)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A deterministic state protocol for autonomous multi-agent systems. State is not a
@@ -357,6 +359,42 @@ agent = AssistantAgent(
 ```
 
 Runnable example: [`examples/autogen_shared_state.py`](examples/autogen_shared_state.py)
+
+### MCP Server: Claude Code, Cursor, Windsurf (`conflux-mcp`)
+
+Conflux ships a zero-dependency **Model Context Protocol (MCP)** stdio server
+(`conflux.mcp` / `conflux-mcp` CLI) so multiple parallel coding or research
+agents can share CRDT counters, registers, sets, and task queues in real time.
+
+Add to your Claude Desktop, Claude Code, or Cursor `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "conflux": {
+      "command": "conflux-mcp",
+      "args": ["--agent-id", "claude-1", "--data", "./.conflux-mcp"]
+    }
+  }
+}
+```
+
+Or connect multiple MCP agent sessions across machines to a shared `conflux-server` mesh:
+
+```json
+{
+  "mcpServers": {
+    "conflux": {
+      "command": "conflux-mcp",
+      "args": ["--agent-id", "cursor-worker-2", "--connect", "127.0.0.1:7001", "--secret", "s3cr3t"]
+    }
+  }
+}
+```
+
+Exposed MCP tools: `conflux_read`, `conflux_snapshot`, `conflux_register_set`,
+`conflux_counter_add`, `conflux_set_add`, `conflux_set_remove`, and
+`conflux_task_update`, plus the live `conflux://state/snapshot` MCP resource.
 
 ## Publishing to PyPI (Trusted Publishing / OIDC)
 

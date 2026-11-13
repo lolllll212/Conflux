@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conflux-state"
-version = "0.8.0"
-description = "Deterministic, lock-free CRDT shared state protocol for concurrent AI agents, with drop-in adapters for LangGraph, CrewAI, and AutoGen."
+version = "0.8.1"
+description = "Deterministic, lock-free CRDT shared state protocol for concurrent AI agents, with MCP server and drop-in adapters for LangGraph, CrewAI, and AutoGen."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -16,6 +16,8 @@ authors = [
 keywords = [
     "multi-agent",
     "ai-agents",
+    "mcp",
+    "model-context-protocol",
     "crdt",
     "distributed-systems",
     "shared-state",
@@ -47,6 +49,7 @@ Issues = "https://github.com/lolllll212/Conflux/issues"
 
 [project.scripts]
 conflux-server = "conflux.server:main"
+conflux-mcp = "conflux.mcp:main"
 
 [project.optional-dependencies]
 crypto = ["cryptography>=3.4"]
