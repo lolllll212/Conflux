@@ -1,21 +1,68 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "conflux"
-version = "0.7.3"
-description = "Deterministic, lock-free state management for concurrent AI agents (CRDT / lattice protocol)."
+name = "conflux-state"
+version = "0.8.0"
+description = "Deterministic, lock-free CRDT shared state protocol for concurrent AI agents, with drop-in adapters for LangGraph, CrewAI, and AutoGen."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Conflux Maintainers" }
+]
+keywords = [
+    "multi-agent",
+    "ai-agents",
+    "crdt",
+    "distributed-systems",
+    "shared-state",
+    "langgraph",
+    "crewai",
+    "autogen",
+    "lattice",
+    "state-management",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/lolllll212/Conflux"
+Repository = "https://github.com/lolllll212/Conflux"
+Documentation = "https://github.com/lolllll212/Conflux#readme"
+Issues = "https://github.com/lolllll212/Conflux/issues"
+
+[project.scripts]
+conflux-server = "conflux.server:main"
 
 [project.optional-dependencies]
 crypto = ["cryptography>=3.4"]
+langgraph = ["langgraph>=0.2.0"]
+crewai = ["crewai>=0.80.0"]
+autogen = ["autogen-agentchat>=0.4.0", "autogen-core>=0.4.0"]
+integrations = [
+    "langgraph>=0.2.0",
+    "crewai>=0.80.0",
+    "autogen-agentchat>=0.4.0",
+    "autogen-core>=0.4.0",
+]
 test = ["pytest", "cryptography>=3.4"]
 
 [tool.setuptools]
-packages = ["conflux"]
+packages = ["conflux", "conflux.integrations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

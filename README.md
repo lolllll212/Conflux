@@ -1,10 +1,32 @@
 # Conflux
 
+[![PyPI](https://img.shields.io/pypi/v/conflux-state.svg)](https://pypi.org/project/conflux-state/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 A deterministic state protocol for autonomous multi-agent systems. State is not a
 set of rows — it is the join of an evolving stream of signed, replayable actions.
 Agents write concurrently to the same shared state with no table locks, no
 two-phase commit, and no central coordinator; every node that has seen the same
 actions converges to the identical state by construction.
+
+## Installation
+
+Install the zero-dependency core package from PyPI (imported in Python as `conflux`):
+
+```bash
+pip install conflux-state
+```
+
+Optional extras for Ed25519 asymmetric signing and framework integrations:
+
+```bash
+pip install "conflux-state[crypto]"        # Ed25519 signing via cryptography
+pip install "conflux-state[langgraph]"     # LangGraph CheckpointSaver + Store
+pip install "conflux-state[crewai]"        # CrewAI Memory StorageBackend + Flow + Tools
+pip install "conflux-state[autogen]"       # AutoGen Memory + FunctionTools
+pip install "conflux-state[integrations]"  # All framework integrations
+```
 
 ## Core use case: shared agent state
 
@@ -253,6 +275,114 @@ workflow = Workflow("fulfill", [
 task = WorkflowRunner(server.replica, workflow).run("fulfill-1", "fulfill",
                                                     inputs={"sku": "A-1"})
 ```
+
+## Framework integrations: LangGraph, CrewAI, AutoGen
+
+`conflux.integrations` ships drop-in adapters that let popular orchestration
+frameworks use Conflux as a **lock-free, convergent shared state backend**.
+Every adapter accepts any Conflux runtime object (`Replica`, `Cluster` node,
+`Server`, or networked/signed `Client`), works out of the box with zero
+third-party dependencies, and automatically inherits each framework's native
+base classes when installed.
+
+### LangGraph (`ConfluxCheckpointSaver` + `ConfluxStore`)
+
+Persist, fork, and resume `StateGraph` checkpoints across separate Conflux
+nodes, and share cross-thread items, CRDT counters, and sets without DB locks:
+
+```python
+from langgraph.graph import StateGraph
+from conflux import Client
+from conflux.integrations.langgraph import ConfluxCheckpointSaver, ConfluxStore
+
+client = Client("127.0.0.1", 7001, agent_id="planner", secret="s3cr3t")
+checkpointer = ConfluxCheckpointSaver(client)
+store = ConfluxStore(client)
+
+graph = builder.compile(checkpointer=checkpointer, store=store)
+graph.invoke({"topic": "CRDTs"}, config={"configurable": {"thread_id": "run-42"}})
+
+# Concurrent CRDT counters & sets across parallel LangGraph workers:
+store.counter_inc(("metrics", "research"), "queries_executed", by=1)
+```
+
+Runnable example: [`examples/langgraph_shared_state.py`](examples/langgraph_shared_state.py)
+
+### CrewAI (`ConfluxCrewStorage`, `ConfluxFlowPersistence`, `create_crewai_tools`)
+
+Plug Conflux into CrewAI's unified `Memory` (`StorageBackend` protocol),
+checkpoint `@persist` Flows across nodes, and give agents direct CRDT tools:
+
+```python
+from crewai import Agent, Crew
+from crewai.memory import Memory
+from conflux import Client
+from conflux.integrations.crewai import (
+    ConfluxCrewStorage,
+    ConfluxFlowPersistence,
+    create_crewai_tools,
+)
+
+client = Client("127.0.0.1", 7001, agent_id="researcher", secret="s3cr3t")
+storage = ConfluxCrewStorage(client)
+tools = create_crewai_tools(client, namespace="crew.")
+
+researcher = Agent(role="Researcher", goal="...", backstory="...", tools=tools)
+crew = Crew(agents=[researcher], tasks=[...], memory=Memory(storage=storage))
+```
+
+Runnable example: [`examples/crewai_shared_memory.py`](examples/crewai_shared_memory.py)
+
+### AutoGen (`ConfluxAutoGenMemory` + `create_autogen_tools`)
+
+Equip AutoGen v0.4+/v0.7+ `AssistantAgent` teams with a replicated
+`autogen_core.memory.Memory` store that injects converged facts + live CRDT
+keys into `ChatCompletionContext`, alongside native `FunctionTool`s:
+
+```python
+from autogen_agentchat.agents import AssistantAgent
+from conflux import Client
+from conflux.integrations.autogen import ConfluxAutoGenMemory, create_autogen_tools
+
+client = Client("127.0.0.1", 7001, agent_id="coder", secret="s3cr3t")
+shared_memory = ConfluxAutoGenMemory(client, state_watch_prefix="team.")
+shared_tools = create_autogen_tools(client, namespace="team.")
+
+agent = AssistantAgent(
+    name="coder",
+    model_client=model_client,
+    memory=[shared_memory],
+    tools=shared_tools,
+)
+```
+
+Runnable example: [`examples/autogen_shared_state.py`](examples/autogen_shared_state.py)
+
+## Publishing to PyPI (Trusted Publishing / OIDC)
+
+Conflux is packaged as **`conflux-state`** on PyPI (imported as `conflux`) and
+ships ready-to-use GitHub Actions workflows in
+[`docs/github-workflows/publish.yml`](docs/github-workflows/publish.yml) and
+[`docs/github-workflows/ci.yml`](docs/github-workflows/ci.yml) using PyPI
+Trusted Publishing (OIDC — no long-lived API tokens required):
+
+1. Move or copy the workflows into `.github/workflows/`:
+   ```bash
+   mkdir -p .github/workflows && cp docs/github-workflows/*.yml .github/workflows/
+   ```
+2. On [pypi.org/manage/account/publishing/](https://pypi.org/manage/account/publishing/),
+   add a **Pending Publisher**:
+   - **PyPI Project Name**: `conflux-state`
+   - **Owner**: `lolllll212`
+   - **Repository name**: `Conflux`
+   - **Workflow name**: `publish.yml`
+   - **Environment name**: `pypi`
+3. Tag and push a release (or publish a GitHub Release):
+   ```bash
+   git tag v0.8.0 && git push origin v0.8.0
+   ```
+   GitHub Actions runs the full test suite, verifies the wheel + sdist via
+   `twine check --strict`, and publishes `conflux-state` to PyPI automatically.
 
 ## Operations: metrics, admin stats, benchmarks
 
