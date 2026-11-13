@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install -e ".[test]"
+
+      - name: Run test suite
+        run: python -m pytest
+
+      - name: Verify sdist and wheel metadata
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m build
+          twine check --strict dist/*
+
+  integrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install optional framework integrations (LangGraph & AutoGen)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,langgraph,autogen]"
+
+      - name: Run integration tests and framework demos
+        run: |
+          python -m pytest tests/test_integrations.py -v
+          python examples/langgraph_shared_state.py
+          python examples/crewai_shared_memory.py
+          python examples/autogen_shared_state.py

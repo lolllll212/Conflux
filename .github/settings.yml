@@ -1,0 +1,7 @@
+# Repository settings synced via https://github.com/apps/settings (Probot Settings)
+# or applied with `gh repo edit` (see scripts/configure_github_repo.sh).
+repository:
+  name: Conflux
+  description: "Deterministic, lock-free CRDT shared state protocol for concurrent AI agents, with drop-in adapters for LangGraph, CrewAI, and AutoGen."
+  homepage: "https://pypi.org/project/conflux-state/"
+  topics: multi-agent, crdt, distributed-systems, ai-agents, langgraph, crewai, autogen, shared-state, python
