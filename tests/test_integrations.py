@@ -318,6 +318,7 @@ def test_autogen_memory_and_tools_convergence():
         "langgraph_shared_state.py",
         "crewai_shared_memory.py",
         "autogen_shared_state.py",
+        "silent_overwrite_benchmark.py",
     ],
 )
 def test_framework_integration_demos_run_clean(script):
@@ -329,7 +330,7 @@ def test_framework_integration_demos_run_clean(script):
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "demo passed:" in proc.stdout
+    assert "passed:" in proc.stdout
 
 
 def test_real_session_hazards_thread_safety_batch_tags_and_large_checkpoints():
