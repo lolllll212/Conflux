@@ -1,1 +1,63 @@
+name: Publish to PyPI
 
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Test & Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build & test tools
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install -e ".[test]"
+
+      - name: Run full test suite
+        run: python -m pytest
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check package metadata with Twine
+        run: twine check --strict dist/*
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish-pypi:
+    name: Publish conflux-state to PyPI (Trusted Publishing / OIDC)
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/conflux-state
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
