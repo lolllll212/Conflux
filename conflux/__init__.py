@@ -31,7 +31,7 @@ from .validate import (
 )
 from .websocket import WebSocket, WSMessenger, WebSocketServer, connect_websocket
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 from .mcp import ConfluxMCPServer, MCP_PROMPTS, MCP_TOOLS
 from . import integrations

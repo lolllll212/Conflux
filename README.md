@@ -319,3 +319,6 @@ python examples/autogen_shared_state.py       # AutoGen context injection & CRDT
 ## 📜 License
 
 Released under the [MIT License](LICENSE). Built for deterministic, resilient multi-agent systems.
+
+<!-- mcp-name: io.github.lolllll212/conflux-state -->
+
