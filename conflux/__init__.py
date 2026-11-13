@@ -13,7 +13,7 @@ from .app import (
     attach_listeners,
 )
 from .client import Client
-from .crdts import GCounter, GSet, LWWRegister, ORMap, ORSet, PNCounter, Stamp, from_dict
+from .crdts import GCounter, GSet, LWWRegister, MVRegister, ORMap, ORSet, PNCounter, Stamp, from_dict
 from .framework import Cluster, DistributedApp, InMemoryTransport
 from .protocol import converge_all, converge_by_gossip, gossip_round, reconcile, replay, state_hash
 from .server import Server
@@ -30,9 +30,11 @@ from .validate import (
     verify_action,
 )
 from .websocket import WebSocket, WSMessenger, WebSocketServer, connect_websocket
-from . import integrations
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
+
+from .mcp import ConfluxMCPServer, MCP_PROMPTS, MCP_TOOLS
+from . import integrations
 
 __all__ = [
     "Action",
@@ -44,6 +46,7 @@ __all__ = [
     "GCounter",
     "GSet",
     "LWWRegister",
+    "MVRegister",
     "ORMap",
     "ORSet",
     "PNCounter",
@@ -83,5 +86,8 @@ __all__ = [
     "WSMessenger",
     "WebSocketServer",
     "connect_websocket",
+    "ConfluxMCPServer",
+    "MCP_PROMPTS",
+    "MCP_TOOLS",
     "integrations",
 ]

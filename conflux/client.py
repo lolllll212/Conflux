@@ -60,6 +60,19 @@ class Client:
     def register_set_weighted(self, key, value, weight):
         return self._submit("lww_set", key, {"value": value, "weight": weight})
 
+    def mv_set(self, key, value, supersedes=None):
+        if supersedes is None:
+            cands = self.candidates(key)
+            supersedes = [c["dot"] for c in cands]
+        else:
+            supersedes = [str(s) for s in supersedes]
+        return self._submit("mv_set", key, {"value": value, "supersedes": supersedes})
+
+    def mv_resolve(self, key, resolved_value):
+        cands = self.candidates(key)
+        dots = [c["dot"] for c in cands]
+        return self._submit("mv_set", key, {"value": resolved_value, "supersedes": dots})
+
     def set_add(self, key, value, tag=None):
         return self._submit("orset_add", key, {"value": value, "tag": tag or self._next_tag()})
 
@@ -132,6 +145,20 @@ class Client:
         if not resp or resp.get("type") != "read_resp":
             raise ConnectionError("failed to read_all")
         return resp.get("value")
+
+    def conflicts(self, prefix=None):
+        self._send({"type": "conflicts", "prefix": prefix})
+        resp = self._recv_safe()
+        if not resp or resp.get("type") != "conflicts_resp":
+            raise ConnectionError("failed to read conflicts")
+        return resp.get("value") or {}
+
+    def candidates(self, key):
+        self._send({"type": "candidates", "key": key})
+        resp = self._recv_safe()
+        if not resp or resp.get("type") != "candidates_resp":
+            raise ConnectionError("failed to read candidates")
+        return resp.get("value") or []
 
     def hash(self):
         self._send({"type": "hash"})

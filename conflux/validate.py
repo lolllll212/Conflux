@@ -10,12 +10,13 @@ from .actions import (
     OP_COUNTER_DEC,
     OP_COUNTER_INC,
     OP_LWW_SET,
+    OP_MV_SET,
     OP_ORSET_ADD,
     OP_ORSET_REMOVE,
     Action,
 )
 
-ALL_OPS = {OP_COUNTER_INC, OP_COUNTER_DEC, OP_LWW_SET, OP_ORSET_ADD, OP_ORSET_REMOVE}
+ALL_OPS = {OP_COUNTER_INC, OP_COUNTER_DEC, OP_LWW_SET, OP_MV_SET, OP_ORSET_ADD, OP_ORSET_REMOVE}
 COUNTER_OPS = {OP_COUNTER_INC, OP_COUNTER_DEC}
 
 ALG_HMAC = "hmac-sha256"
@@ -103,6 +104,16 @@ def _validate_params(op, params):
     elif op == OP_LWW_SET:
         if "value" not in params or not _is_json_safe(params["value"]):
             raise ValidationError("lww_set requires a JSON-safe value")
+    elif op == OP_MV_SET:
+        if "value" not in params or not _is_json_safe(params["value"]):
+            raise ValidationError("mv_set requires a JSON-safe value")
+        supersedes = params.get("supersedes")
+        if supersedes is not None:
+            if not isinstance(supersedes, (list, tuple)) or not all(
+                isinstance(s, str) and ":" in s and not any(ord(c) < 32 for c in s)
+                for s in supersedes
+            ):
+                raise ValidationError("mv_set supersedes must be a list of 'tick:agent' dot strings")
     elif op == OP_ORSET_ADD:
         tag = params.get("tag", "")
         _check_tag(tag)

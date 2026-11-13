@@ -1,4 +1,12 @@
-from .actions import Action, OP_COUNTER_DEC, OP_COUNTER_INC, OP_LWW_SET, OP_ORSET_ADD, OP_ORSET_REMOVE
+from .actions import (
+    Action,
+    OP_COUNTER_DEC,
+    OP_COUNTER_INC,
+    OP_LWW_SET,
+    OP_MV_SET,
+    OP_ORSET_ADD,
+    OP_ORSET_REMOVE,
+)
 from .state import Replica
 
 OP_ALIASES = {
@@ -44,6 +52,18 @@ class DistributedApp:
 
     def register_set_weighted(self, key, value, weight):
         return self.emit(OP_LWW_SET, key, {"value": value, "weight": weight})
+
+    def mv_set(self, key, value, supersedes=None):
+        return self.replica.mv_set(key, value, supersedes=supersedes)
+
+    def mv_resolve(self, key, resolved_value):
+        return self.replica.mv_resolve(key, resolved_value)
+
+    def conflicts(self, prefix=None):
+        return self.replica.conflicts(prefix=prefix)
+
+    def candidates(self, key):
+        return self.replica.candidates(key)
 
     def set_add(self, key, value, tag=None):
         return self.emit(OP_ORSET_ADD, key, {"value": value, "tag": tag or self._next_tag()})
