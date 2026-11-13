@@ -210,6 +210,97 @@ class ORSet(Lattice):
 
 
 @dataclass(frozen=True)
+class MVRegister(Lattice):
+    """Multi-Value Register (Causal CRDT) for conflict-preserving concurrent writes.
+
+    Each write records a ``(value, stamp, supersedes)`` causal entry. When two
+    agents write concurrently without having observed each other's stamp, BOTH
+    concurrent candidate values survive the lattice join in ``conflicts()`` /
+    ``candidates()``, while ``read()`` returns the deterministic canonical winner.
+    Once an agent issues a write whose ``supersedes`` contains those prior stamps,
+    the superseded entries are pruned cleanly across every replica.
+    """
+
+    entries: Mapping[str, Any] = field(default_factory=dict)  # "tick:agent" -> value
+    superseded: frozenset = frozenset()  # frozenset of "tick:agent" dot strings
+
+    @staticmethod
+    def dot_of(stamp: Stamp) -> str:
+        return f"{stamp.tick}:{stamp.agent}"
+
+    @staticmethod
+    def parse_dot(dot: str) -> Stamp:
+        tick_s, _, agent = dot.partition(":")
+        return Stamp(int(tick_s), agent)
+
+    def write(self, value: Any, stamp: Stamp, supersedes: frozenset | set | list | tuple = ()):
+        dot = self.dot_of(stamp)
+        sup = self.superseded | frozenset(str(d) for d in supersedes)
+        merged_entries = dict(self.entries)
+        if dot not in merged_entries or _canonical_value(merged_entries[dot]) < _canonical_value(value):
+            merged_entries[dot] = value
+        active = {d: v for d, v in merged_entries.items() if d not in sup}
+        return MVRegister(active, sup)
+
+    def merge(self, other):
+        sup = self.superseded | other.superseded
+        merged_entries: dict[str, Any] = {}
+        for dot, val in self.entries.items():
+            if dot not in sup:
+                merged_entries[dot] = val
+        for dot, val in other.entries.items():
+            if dot in sup:
+                continue
+            if dot not in merged_entries or _canonical_value(merged_entries[dot]) < _canonical_value(val):
+                merged_entries[dot] = val
+        return MVRegister(merged_entries, sup)
+
+    def candidates(self) -> list[dict[str, Any]]:
+        """Return all active concurrent candidate entries ordered deterministically (winner first)."""
+        active = [
+            (self.parse_dot(dot), dot, val)
+            for dot, val in self.entries.items()
+            if dot not in self.superseded
+        ]
+        active.sort(key=lambda item: (item[0], _canonical_value(item[2])), reverse=True)
+        return [
+            {
+                "dot": dot,
+                "tick": st.tick,
+                "agent": st.agent,
+                "value": val,
+            }
+            for st, dot, val in active
+        ]
+
+    def has_conflict(self) -> bool:
+        """True when 2+ distinct concurrent values exist that have not been causally resolved."""
+        distinct = {repr(_canonical_value(c["value"])) for c in self.candidates()}
+        return len(distinct) > 1
+
+    def active_dots(self) -> tuple[str, ...]:
+        return tuple(sorted(d for d in self.entries if d not in self.superseded))
+
+    def read(self):
+        cands = self.candidates()
+        return cands[0]["value"] if cands else None
+
+    def canonical(self):
+        elems = sorted(
+            ((d, _canonical_value(v)) for d, v in self.entries.items() if d not in self.superseded),
+            key=repr,
+        )
+        return ["mv", elems, sorted(self.superseded)]
+
+    def to_dict(self):
+        return {
+            "t": "mv",
+            "entries": dict(self.entries),
+            "superseded": sorted(self.superseded),
+        }
+
+
+@dataclass(frozen=True)
 class ORMap(Lattice):
     fields: Mapping[str, Lattice] = field(default_factory=dict)
 
@@ -261,6 +352,8 @@ def from_dict(data):
         return GSet(frozenset(data["elements"]))
     if kind == "orset":
         return ORSet(data["elements"], frozenset(data["tombstones"]))
+    if kind == "mv":
+        return MVRegister(dict(data["entries"]), frozenset(data.get("superseded", ())))
     if kind == "ormap":
         return ORMap({k: from_dict(v) for k, v in data["fields"].items()})
     raise ValueError(f"unknown crdt {kind!r}")

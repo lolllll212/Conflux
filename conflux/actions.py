@@ -2,11 +2,12 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from .crdts import LWWRegister, ORSet, PNCounter, Stamp
+from .crdts import LWWRegister, MVRegister, ORSet, PNCounter, Stamp
 
 OP_COUNTER_INC = "counter_inc"
 OP_COUNTER_DEC = "counter_dec"
 OP_LWW_SET = "lww_set"
+OP_MV_SET = "mv_set"
 OP_ORSET_ADD = "orset_add"
 OP_ORSET_REMOVE = "orset_remove"
 
@@ -65,6 +66,11 @@ class Action:
             return PNCounter({slot: (0, by)})
         if self.op == OP_LWW_SET:
             return LWWRegister(self.params["value"], Stamp(self.tick, self.agent))
+        if self.op == OP_MV_SET:
+            supersedes = self.params.get("supersedes", ())
+            return MVRegister().write(
+                self.params["value"], Stamp(self.tick, self.agent), supersedes=supersedes
+            )
         if self.op == OP_ORSET_ADD:
             return ORSet({self.params["tag"]: self.params["value"]}, frozenset())
         if self.op == OP_ORSET_REMOVE:

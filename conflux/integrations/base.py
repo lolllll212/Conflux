@@ -70,6 +70,26 @@ class BackendAdapter:
                 return self._server_emit("lww_set", key, {"value": value, "weight": weight})
             return self.target.register_set_weighted(key, value, weight)
 
+    def mv_set(self, key: str, value: Any, supersedes: list[str] | tuple[str, ...] | None = None):
+        with self._lock:
+            if self._kind == "server":
+                with self.target.lock:
+                    if supersedes is None:
+                        cands = self.target.replica.candidates(key)
+                        actual_sup = [c["dot"] for c in cands]
+                    else:
+                        actual_sup = [str(s) for s in supersedes]
+                return self._server_emit("mv_set", key, {"value": value, "supersedes": actual_sup})
+            return self.target.mv_set(key, value, supersedes=supersedes)
+
+    def mv_resolve(self, key: str, resolved_value: Any):
+        with self._lock:
+            if self._kind == "server":
+                with self.target.lock:
+                    dots = [c["dot"] for c in self.target.replica.candidates(key)]
+                return self._server_emit("mv_set", key, {"value": resolved_value, "supersedes": dots})
+            return self.target.mv_resolve(key, resolved_value)
+
     def set_add(self, key: str, value: Any, tag: str | None = None):
         with self._lock:
             if self._kind == "server":
@@ -130,6 +150,14 @@ class BackendAdapter:
 
     def keys(self, prefix: str | None = None) -> list[str]:
         return sorted(self.view(prefix=prefix).keys())
+
+    def conflicts(self, prefix: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        with self._lock:
+            return self.target.conflicts(prefix=prefix)
+
+    def candidates(self, key: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return self.target.candidates(key)
 
     def hash(self) -> str:
         with self._lock:

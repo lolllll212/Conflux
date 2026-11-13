@@ -1,345 +1,247 @@
-# Conflux
+<div align="center">
 
-[![PyPI](https://img.shields.io/pypi/v/conflux-state.svg)](https://pypi.org/project/conflux-state/)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+# ⚡ Conflux (`conflux-state`)
+
+### The Conflict-Aware, Lock-Free CRDT Shared State Protocol for Multi-Agent AI
+
+[![PyPI version](https://img.shields.io/pypi/v/conflux-state.svg?color=0ea5e9&label=PyPI%20%7C%20conflux-state)](https://pypi.org/project/conflux-state/)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%20%E2%80%93%203.13-3b82f6.svg)](https://www.python.org/)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lolllll212/Conflux/blob/master/examples/quickstart_colab.ipynb)
-[![MCP Ready](https://img.shields.io/badge/MCP-conflux--mcp-purple.svg)](#mcp-server-claude-code-cursor-windsurf)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![MCP Ready](https://img.shields.io/badge/MCP%20Server-conflux--mcp-8b5cf6.svg)](#mcp-server-claude-code-cursor--windsurf-conflux-mcp)
+[![Zero Core Deps](https://img.shields.io/badge/Core%20Dependencies-Zero-10b981.svg)](#architecture--lattice-crdts)
+[![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b.svg)](LICENSE)
 
-A deterministic state protocol for autonomous multi-agent systems. State is not a
-set of rows — it is the join of an evolving stream of signed, replayable actions.
-Agents write concurrently to the same shared state with no table locks, no
-two-phase commit, and no central coordinator; every node that has seen the same
-actions converges to the identical state by construction.
-
-## Installation
-
-Install the zero-dependency core package from PyPI (imported in Python as `conflux`):
+**Stop losing agent work to `database is locked`, silent dict overwrites, and rogue hallucinations.**  
+Conflux models shared agent state as a **mathematical join-semilattice** of signed, replayable actions — giving **Claude Code, Cursor, LangGraph, CrewAI, and AutoGen** swarms zero-lock concurrency, causal conflict detection, and cryptographic trust boundaries.
 
 ```bash
 pip install conflux-state
 ```
 
-Optional extras for Ed25519 asymmetric signing and framework integrations:
+[60-Second Quickstart](#-60-second-quickstart) •
+[Why Conflux?](#-why-ai-swarms-break-traditional-databases) •
+[Conflict Engine (`MVRegister`)](#-causal-conflict-preservation--resolution-mvregister) •
+[MCP Server (`conflux-mcp`)](#-mcp-server-claude-code-cursor--windsurf-conflux-mcp) •
+[LangGraph / CrewAI / AutoGen](#-drop-in-framework-integrations) •
+[Security & Benchmarks](#-security-durability--benchmarks)
+
+</div>
+
+---
+
+## 🔥 Why AI Swarms Break Traditional Databases
+
+When 10–30 autonomous agents collaborate on one codebase, research workflow, or incident response room, shared state turns into a bottleneck:
+
+| Failure Mode | Dicts / JSON Files | SQLite / Row-Locked SQL | ⚡ **Conflux (`conflux-state`)** |
+| :--- | :---: | :---: | :---: |
+| **Concurrent Multi-Agent Writes** | Silent clobbering | Lock contention / deadlocks | **Lock-free lattice join (`a ⨆ b = b ⨆ a`)** |
+| **Conflicting Parallel Decisions** | Last write silently erases peer | Transaction abort | **`MVRegister` preserves ALL concurrent candidates until resolved** |
+| **Edit Collisions on Shared Files** | Agents overwrite each other | Custom polling tables | **Built-in TTL resource leases (`conflux_claim_resource`)** |
+| **Hallucinating / Rogue Agent** | Corrupts arbitrary keys | Full table write access | **HMAC / Ed25519 signatures + per-agent namespace & quota guards** |
+| **Hard Crash (`kill -9`) & Partitions** | Corrupted state | Needs WAL / cluster ops | **Fsynced HMAC-signed journals + cumulative snapshots + auto-heal** |
+| **Core Runtime Dependencies** | — | External DB / drivers | **Zero (100% Python stdlib TCP, RFC6455 WebSocket, TLS, Prometheus)** |
+
+---
+
+## 📦 Installation
+
+Install the **zero-dependency** core protocol + `conflux-server` + `conflux-mcp` CLI from PyPI (imported in Python as `conflux`):
 
 ```bash
-pip install "conflux-state[crypto]"        # Ed25519 signing via cryptography
+pip install conflux-state
+```
+
+Optional extras for asymmetric Ed25519 keys and native orchestration frameworks:
+
+```bash
+pip install "conflux-state[crypto]"        # Ed25519 public-key signing
 pip install "conflux-state[langgraph]"     # LangGraph CheckpointSaver + Store
-pip install "conflux-state[crewai]"        # CrewAI Memory StorageBackend + Flow + Tools
+pip install "conflux-state[crewai]"        # CrewAI StorageBackend + FlowPersistence + Tools
 pip install "conflux-state[autogen]"       # AutoGen Memory + FunctionTools
-pip install "conflux-state[integrations]"  # All framework integrations
+pip install "conflux-state[integrations]"  # All framework adapters
 ```
 
-## Core use case: shared agent state
+---
 
-The headline problem conflux solves is **shared agent state**: a few dozen
-agents of one application reading and mutating the same counters, registers,
-and sets — fleet progress, job counters, leader/slot election, capability
-flags, hand-off pointers — with signed writes, durable replay, and crash
-recovery, on a mesh of commodity TCP/WebSocket nodes. Two adjacent use cases
-ride on the same fabric: **workflow state** (task queues and step status
-through `TaskStore` and deterministic `Workflow`) and a **replicated memory /
-knowledge layer** (an agent's shared facts as register/set/string slots).
-All three are one storage geometry; the product pitches the agent-state head.
-
-This is not a blockchain and not a distributed SQL system. It is a replicated
-state fabric built on mathematically convergent data structures (CRDTs / lattice
-theory) — a coordination layer for distributed AI workflows.
-
-## Product definition and scope
-
-Conflux is a **small-crew deterministic state fabric** for a few dozen agents
-of a single application: signed, replayable, eventually-consistent shared
-agent state with durable journaling and crash recovery. The protocol is
-specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md); every claim in it maps to
-a test (conformance index at the end of the spec). The signing, identity, and
-storage subsystems are reviewed in [`docs/SECURITY.md`](docs/SECURITY.md),
-which also states the trust boundary and the open findings. Conflux is
-released under the [MIT License](LICENSE).
-
-Scope — what it is:
-
-- deterministic convergence: same action set ⇒ same `state_hash`, in any order;
-- signed identity: HMAC (zero deps) or Ed25519, plus op/namespace/quota rules;
-- durability: fsynced journal + cumulative snapshots that survive a hard crash;
-- TCP and WebSocket transports, TLS on both, gossip between peer nodes.
-
-Explicitly out of scope (backlog, not promised):
-
-- linearizable reads, multi-region federation,
-  general-scale KV, blockchain-style global ordering.
-
-## Problem
-
-Classic distributed databases serialize writes: a crew of agents updating the
-same operation counters, queue pointers, capability flags, or hand-off state
-either blocks itself (latency) or deadlocks. Locks scale poorly once agents
-outnumber transactions — and agent crews are exactly that regime: many writers,
-one small shared state.
-
-## Approach
-
-Conflux treats shared state not as static rows but as the join of an evolving stream
-of probabilistic actions. Every value living in the store is an element of a
-join-semilattice, so any two replicas can merge their states with a single
-commutative, associative, idempotent operation — the lattice join. Because a join is
-order-independent, every replica that has seen the same set of actions converges to
-the identical state, no matter the delivery order.
-
-```
-state  =  join(contribution(action_1), ..., contribution(action_n))
-```
-
-## Core concepts
-
-### The lattice
-
-`Lattice` is the abstract contract: every CRDT implements `merge(other)` (the join),
-`read()`, and `canonical()` (a deterministic fingerprint used for hashing). The join
-laws are verified directly in `tests/test_crdts.py`:
-
-- idempotent: `a ⨆ a = a`
-- commutative: `a ⨆ b = b ⨆ a`
-- associative: `(a ⨆ b) ⨆ c = a ⨆ (b ⨆ c)`
-
-### CRDT types
-
-| Type            | Field         | Meaning                                             |
-| --------------- | ------------- | --------------------------------------------------- |
-| `GCounter`      | count per key | grow-only counter, merge = elementwise max          |
-| `PNCounter`     | (p, n) slots  | counters with increments and decrements             |
-| `LWWRegister`   | value, stamp  | last-writer-wins register, stamp = (tick, agent)    |
-| `GSet`          | set           | grows only, merge = union                           |
-| `ORSet`         | tags, values  | add/remove with tombstones, merge = union           |
-| `ORMap`         | key -> CRDT    | grows-only keys over any of the above               |
-
-Register values are ordinary JSON-ish values; equal stamps (or equal set tags, an
-invalid protocol usage) are resolved deterministically by canonical order so every
-replica still picks the same winner.
-
-### Actions and determinism
-
-Agents do not mutate shared rows. They emit immutable `Action`s, each with a globally
-unique `action_id`, an `agent`, a logical `tick`, an operation, and params:
+## 🚀 60-Second Quickstart
 
 ```python
-Action(action_id="act-agent-1-42", agent="agent-1", tick=42,
-       op="counter_inc", key="orders", params={"by": 5})
-```
+from conflux import Cluster, InMemoryTransport, state_hash
 
-Probabilistic actions carry a `weight` param. Whether an action "fires" is decided by
-`SHA-256(action_id, key)` projected onto a fixed-point 32-bit scale — a pure function
-every replica can compute, so probabilistic inference produces identical state
-everywhere without any coordination.
+# 3 autonomous agents writing concurrently with ZERO locks or coordinator
+cluster = Cluster({"planner", "coder", "verifier"}, transport=InMemoryTransport())
 
-### Convergence protocol
+cluster.node("planner").counter_inc("swarm.tasks_done", 2)
+cluster.node("coder").counter_inc("swarm.tasks_done", 3)
+cluster.node("verifier").set_add("swarm.verified_modules", "auth.py")
 
-- Each agent owns a `Replica` — its local join of the actions it has seen. Its
-  journal is append-only and de-duplicated by `action_id`.
-- `reconcile(a, b)`: the two replicas exchange journals and absorb what they have not
-  seen. Absorption is exactly the lattice join.
-- `converge_all(replicas)`: full-mesh anti-entropy sweep (for tests and small crews).
-- `converge_by_gossip(replicas, rounds)`: randomized pairwise anti-entropy (for
-  large, partial meshes).
-- `Cluster` / `DistributedApp` / `InMemoryTransport`: a thin network abstraction to
-  demonstrate the protocol over message passing.
+# Concurrent conflicting proposals on an MVRegister (neither agent has seen the other yet!)
+cluster.node("planner").mv_set("arch.cache_layer", "redis-cluster")
+cluster.node("coder").mv_set("arch.cache_layer", "in-memory-lru")
 
-Any two replicas that have both absorbed the union of available actions are
-provably identical: identical action sets + identical join = identical state. A
-consensus fingerprint, `state_hash(state)`, is a SHA-256 over the canonical
-serialization.
-
-## Quick start
-
-```python
-from conflux import Cluster, InMemoryTransport
-
-cluster = Cluster({"agent-a", "agent-b", "agent-c"}, transport=InMemoryTransport())
-cluster.node("agent-a").counter_inc("orders", 5)
-cluster.node("agent-b").counter_inc("orders", 3)
-cluster.node("agent-c").register_set_weighted("risk.appetite", "low", weight=0.6)
+# Single anti-entropy gossip sweep -> identical SHA-256 state across all nodes
 cluster.gossip_round()
 
-assert cluster.read("agent-a", "orders") == 8
-assert cluster.read("agent-b", "orders") == 8
+assert cluster.read("planner", "swarm.tasks_done") == 5
+assert state_hash(cluster.node("planner").replica.state) == state_hash(cluster.node("coder").replica.state)
+
+# Both concurrent proposals survived the merge! Inspect & causally resolve:
+print(cluster.node("verifier").conflicts())
+# -> {'arch.cache_layer': [{'agent': 'planner', 'value': 'redis-cluster', ...},
+#                          {'agent': 'coder',   'value': 'in-memory-lru', ...}]}
+
+cluster.node("verifier").mv_resolve("arch.cache_layer", "tiered-lru-plus-redis")
+cluster.gossip_round()
+assert cluster.node("planner").conflicts() == {}
+assert cluster.read("planner", "arch.cache_layer") == "tiered-lru-plus-redis"
 ```
 
-Deterministic replay from a journal:
+---
+
+## 🧠 Architecture & Lattice CRDTs
+
+```text
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │ Claude Code  │     │  LangGraph   │     │    CrewAI    │     │   AutoGen    │
+  │ (conflux-mcp)│     │ Checkpointer │     │ Memory/Flows │     │ Team Memory  │
+  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+         │  Signed Envelopes (HMAC-SHA256 / Ed25519 + Namespace & Quota Guards)
+         ▼                    ▼                    ▼                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                 Conflux Gossip Mesh (TCP / RFC6455 WS / TLS)                │
+  │    Node Alpha  ◄───────  Pairwise Anti-Entropy Join  ───────►  Node Beta    │
+  │  [Journal + Snapshots]     state = join(a_1, ..., a_n)     [Journal + Snaps]│
+  └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Every key in Conflux lives inside an `ORMap` over mathematically verified join-semilattices (`tests/test_crdts.py` & `tests/test_mcp.py`):
+- **Idempotent:** $a \sqcup a = a$
+- **Commutative:** $a \sqcup b = b \sqcup a$
+- **Associative:** $(a \sqcup b) \sqcup c = a \sqcup (b \sqcup c)$
+
+| CRDT Primitive | API / Op | Conflict Semantics & Best Use Case |
+| :--- | :--- | :--- |
+| **`GCounter` / `PNCounter`** | `counter_inc`, `counter_dec` | Exact lock-free sums across agents (token budgets, job counts, retries). |
+| **`LWWRegister`** | `register_set` (`lww_set`) | Deterministic `(tick, agent)` + canonical value tie-break (status flags, leader slot). |
+| **`MVRegister`** *(New)* | `mv_set`, `mv_resolve` | **Causal Multi-Value Register** — preserves *all* concurrent un-synced edits as inspectable candidates until causally resolved. |
+| **`GSet` / `ORSet`** | `set_add`, `set_remove` | Observed-Remove Set with tag tombstones & compaction (online roster, discovered URLs/bugs). |
+| **`Probabilistic Actions`** | `weight=0.0..1.0` | `SHA-256(action_id, key)` 32-bit projection — stochastic decisions replay identically on every node. |
+
+---
+
+## ⚔️ Causal Conflict Preservation & Resolution (`MVRegister`)
+
+Last-Writer-Wins (`LWWRegister`) is ideal for status heartbeats, **but dangerous when two agents concurrently draft an architecture spec, API schema, or plan** while partitioned.
+
+Conflux's **`MVRegister`** tracks causal `(tick:agent)` dots and superseded sets:
+1. **Sequential updates** on a node automatically supersede the dots that node has already seen — behaving like a clean register with zero clutter.
+2. **True concurrent writes** (emitted before gossip sync) **preserve every competing agent's value** in `conflicts()` / `candidates(key)`, while `read(key)` still returns a deterministic canonical winner so readers never crash.
+3. **Causal resolution (`mv_resolve`)** records a merged value superseding all observed candidate dots — clearing the conflict across the entire cluster permanently (even if delayed pre-resolution gossip arrives later!).
 
 ```python
-from conflux import state_hash, replay
-from conflux.protocol import journal_from_json, journal_to_json
+from conflux import Client
 
-blob = journal_to_json(cluster.node("agent-a"))
-actions = journal_from_json(blob)
-# fold in any order, every time, always the same state:
-assert state_hash(replay(actions).state) == state_hash(cluster.node("agent-b").state)
+with Client("127.0.0.1", 7001, agent_id="lead-reviewer") as c:
+    for key, candidates in c.conflicts(prefix="spec.").items():
+        print(f"Conflict on {key}: {[cand['value'] for cand in candidates]}")
+        c.mv_resolve(key, {"merged": True, "approved_by": "lead-reviewer"})
 ```
 
-## Protocol hardening: versioning, signatures, authority
+---
 
-Actions travel as envelopes that any node can verify before they touch state.
+## 🔌 MCP Server: Claude Code, Cursor & Windsurf (`conflux-mcp`)
 
+Run multiple coding or research agents in parallel on the same repository without stepping on each other's files or losing shared context. `conflux-mcp` is a **zero-dependency MCP JSON-RPC 2.0 server** supporting both newline-delimited stdio and `Content-Length` framing.
+
+### Add to Claude Desktop / Claude Code / Cursor (`mcp.json`)
+
+**Standalone durable local mode (zero setup):**
 ```json
 {
-  "action": { "action_id": "act-a-1", "agent": "a", "tick": 1, "op": "counter_inc",
-              "key": "orders", "params": {"by": 3}, "version": 1 },
-  "signed_by": "a",
-  "signature": "<signature over canonical action bytes>",
-  "alg": "hmac-sha256"
+  "mcpServers": {
+    "conflux": {
+      "command": "conflux-mcp",
+      "args": ["--agent-id", "claude-architect", "--data", "./.conflux-mcp"]
+    }
+  }
 }
 ```
 
-- **Versioning.** Every action carries `version`; the validator rejects unknown
-  versions, so protocol changes are explicit (current: `1`).
-- **Signatures.** `sign_action(action, secret)` produces an HMAC-SHA256 over the
-  canonical (key-sorted) JSON of the action (zero dependencies). For asymmetric
-  identity, pass `alg="ed25519"` with a raw private key — `generate_ed25519_keypair()`
-  returns `(private, public)`, `verify_action(envelope, public, "ed25519")` checks it.
-  Ed25519 requires the optional `cryptography` package; HMAC needs nothing.
-- **Identity + authority.** `AgentRegistry` maps agent ids to a secret (HMAC) *or* a
-  public key (Ed25519), plus allowed op sets and per-agent write quotas.
-  `validate_envelope` checks signer identity, signature, authorization, and quota
-  before a node ever merges, and refuses envelopes whose algorithm does not match
-  the agent's registered key.
-- **Schema.** `validate_action` enforces op-specific payload rules (counter `by`,
-  JSON-safe register/set values, non-empty tags, `weight` in `[0, 1]`).
-
-A server equipped with a registry refuses unverified, unauthorized, or
-quota-exhausted submits (`{"type": "error", "reason": "..."}`); a server without
-one still schema-validates but runs in trust-less dev mode. Note that the
-registry guards the agent `submit` path only — the peer gossip path is trusted
-at the network layer, and every node's listen port must therefore be treated
-as a peer-trusted boundary. [`docs/SECURITY.md`](docs/SECURITY.md) walks
-through what the signing, identity, and storage layers do and do not
-guarantee, with each property mapped to the code and tests that enforce it.
-
-```python
-from conflux import AgentRegistry, Client, Server
-
-registry = AgentRegistry()
-registry.register("driver", "s3cr3t", ops={"counter_inc", "lww_set"}, quota=1000)
-server = Server("n1", ("127.0.0.1", 7001), registry=registry)
-server.start()
-
-client = Client("127.0.0.1", 7001, agent_id="driver", secret="s3cr3t")
-client.counter_inc("orders", 5)   # signed, authorized, quota-counted
+**Multi-agent networked mesh mode (connect N parallel agents to `conflux-server`):**
+```json
+{
+  "mcpServers": {
+    "conflux": {
+      "command": "conflux-mcp",
+      "args": [
+        "--agent-id", "cursor-worker-2",
+        "--connect", "127.0.0.1:7001",
+        "--secret", "worker-2-hmac-secret",
+        "--namespace", "repo."
+      ]
+    }
+  }
+}
 ```
 
-## Running the tests
+### Capabilities Exposed by `conflux-mcp`
 
-```bash
-python -m pytest
-```
+- **13 Specialized MCP Tools:**
+  - **Conflict-Aware State:** `conflux_mv_write`, `conflux_conflicts`, `conflux_resolve_conflict`
+  - **Resource / File Leases:** `conflux_claim_resource` (TTL lease + owner & intent reporting to prevent simultaneous file edits), `conflux_release_resource`
+  - **Core CRDTs & Batching:** `conflux_read`, `conflux_snapshot`, `conflux_register_set`, `conflux_counter_add`, `conflux_set_add`, `conflux_set_remove`, `conflux_batch`
+  - **Reactive Handoffs & Queues:** `conflux_watch_wait` (blocks until a peer updates a key), `conflux_task_update`
+- **MCP Prompts (`/resolve_state_conflicts`, `/coordinate_parallel_swarm`):** One-slash-command workflows that inject live conflicts or swarm coordination rules into the agent's context.
+- **MCP Resources & URI Templates:** `conflux://state/snapshot`, `conflux://state/conflicts`, and `conflux://key/{key}`.
 
-The suite covers join laws, threaded lock-free convergence, merge-order
-determinism, probabilistic determinism, journal round-tripping, the
-network-framework gossip path, the networked backend (client round-trip,
-two-node gossip convergence, restart persistence), signed-envelope authority,
-namespaces, the WebSocket transport (RFC6455 framing, WS node convergence,
-discovery, batching, backoff), the application layer (events, watchers,
-task state, deterministic workflows), and the operational surface (TLS framing
-over tcp + ws, signed/verified journals, membership + partition heal, and
-cumulative snapshot compaction).
+---
 
-## Application layer: workflows, tasks, events, watchers
+## 🧩 Drop-In Framework Integrations
 
-Everything sits on the same replicated fabric, so application state converges
-and replays exactly like raw CRDT state.
+Every adapter in `conflux.integrations` accepts a `Replica`, `Cluster` node, `Server`, or networked `Client`, works with **zero third-party dependencies**, and automatically subclasses each framework's native interfaces when installed.
 
-- **`EventBus`** — subscribe to the action stream by op, exact key, or key
-  prefix; handlers get `(action, origin)` where origin is `local` (this node's
-  own emit) or `absorb` (received from a peer). `Server.subscribe(...)` wires it
-  onto the live wire path.
-- **`Watcher`** — value-level snapshots: `watch(key, handler)` fires when a
-  key's effective value changes, with the previous value.
-- **`TaskStore`** — replicated task execution state under `tasks/<id>`
-  (created → running → step → done/failed), each transition a signed,
-  deterministic `lww_set`.
-- **`Workflow` / `WorkflowRunner`** — ordered steps (`counter_inc`, `lww_set`,
-  `orset_add`, `orset_remove`, `noop`) against keys, with optional
-  `weight`-gated steps decided by the same deterministic hash every replica can
-  reproduce. Identical inputs always emit identical action logs.
+### 1. LangGraph (`ConfluxCheckpointSaver` + `ConfluxStore`)
+Pause a `StateGraph` on **Node A**, replicate over gossip, and resume the exact same `thread_id` on **Node B** — while aggregating cross-thread CRDT counters and sets with zero locks:
 
 ```python
-from conflux import Server, Workflow, WorkflowRunner, WorkflowStep, TaskStore
-
-server = Server("n1", ("127.0.0.1", 7001))
-server.start()
-server.subscribe(lambda action, origin: print("event:", origin, action.op),
-                 op="counter_inc")
-server.watch("wf/shipments", lambda value, key, old: print("watched:", value))
-
-workflow = Workflow("fulfill", [
-    WorkflowStep("reserve", "counter_inc", key="wf/capacity", params={"by": 1}),
-    WorkflowStep("ship", "orset_add", key="wf/shipments", params={"value": "carrier-17"}),
-])
-task = WorkflowRunner(server.replica, workflow).run("fulfill-1", "fulfill",
-                                                    inputs={"sku": "A-1"})
-```
-
-## Framework integrations: LangGraph, CrewAI, AutoGen
-
-`conflux.integrations` ships drop-in adapters that let popular orchestration
-frameworks use Conflux as a **lock-free, convergent shared state backend**.
-Every adapter accepts any Conflux runtime object (`Replica`, `Cluster` node,
-`Server`, or networked/signed `Client`), works out of the box with zero
-third-party dependencies, and automatically inherits each framework's native
-base classes when installed.
-
-### LangGraph (`ConfluxCheckpointSaver` + `ConfluxStore`)
-
-Persist, fork, and resume `StateGraph` checkpoints across separate Conflux
-nodes, and share cross-thread items, CRDT counters, and sets without DB locks:
-
-```python
-from langgraph.graph import StateGraph
 from conflux import Client
 from conflux.integrations.langgraph import ConfluxCheckpointSaver, ConfluxStore
 
 client = Client("127.0.0.1", 7001, agent_id="planner", secret="s3cr3t")
-checkpointer = ConfluxCheckpointSaver(client)
 store = ConfluxStore(client)
 
-graph = builder.compile(checkpointer=checkpointer, store=store)
+graph = builder.compile(
+    checkpointer=ConfluxCheckpointSaver(client),
+    store=store,
+)
 graph.invoke({"topic": "CRDTs"}, config={"configurable": {"thread_id": "run-42"}})
-
-# Concurrent CRDT counters & sets across parallel LangGraph workers:
 store.counter_inc(("metrics", "research"), "queries_executed", by=1)
 ```
+> Runnable demo: [`examples/langgraph_shared_state.py`](examples/langgraph_shared_state.py)
 
-Runnable example: [`examples/langgraph_shared_state.py`](examples/langgraph_shared_state.py)
-
-### CrewAI (`ConfluxCrewStorage`, `ConfluxFlowPersistence`, `create_crewai_tools`)
-
-Plug Conflux into CrewAI's unified `Memory` (`StorageBackend` protocol),
-checkpoint `@persist` Flows across nodes, and give agents direct CRDT tools:
+### 2. CrewAI (`ConfluxCrewStorage`, `ConfluxFlowPersistence`, `create_crewai_tools`)
+Plug Conflux directly into CrewAI's unified `Memory` (`StorageBackend` protocol with cosine-similarity + scoped recall), `@persist` Flows, and agent CRDT tools:
 
 ```python
 from crewai import Agent, Crew
 from crewai.memory import Memory
 from conflux import Client
-from conflux.integrations.crewai import (
-    ConfluxCrewStorage,
-    ConfluxFlowPersistence,
-    create_crewai_tools,
-)
+from conflux.integrations.crewai import ConfluxCrewStorage, create_crewai_tools
 
 client = Client("127.0.0.1", 7001, agent_id="researcher", secret="s3cr3t")
-storage = ConfluxCrewStorage(client)
-tools = create_crewai_tools(client, namespace="crew.")
-
-researcher = Agent(role="Researcher", goal="...", backstory="...", tools=tools)
-crew = Crew(agents=[researcher], tasks=[...], memory=Memory(storage=storage))
+researcher = Agent(
+    role="Researcher",
+    goal="...",
+    backstory="...",
+    tools=create_crewai_tools(client, namespace="crew."),
+)
+crew = Crew(agents=[researcher], tasks=[...], memory=Memory(storage=ConfluxCrewStorage(client)))
 ```
+> Runnable demo: [`examples/crewai_shared_memory.py`](examples/crewai_shared_memory.py)
 
-Runnable example: [`examples/crewai_shared_memory.py`](examples/crewai_shared_memory.py)
-
-### AutoGen (`ConfluxAutoGenMemory` + `create_autogen_tools`)
-
-Equip AutoGen v0.4+/v0.7+ `AssistantAgent` teams with a replicated
-`autogen_core.memory.Memory` store that injects converged facts + live CRDT
-keys into `ChatCompletionContext`, alongside native `FunctionTool`s:
+### 3. AutoGen (`ConfluxAutoGenMemory` + `create_autogen_tools`)
+Inject converged team memories and live CRDT state keys straight into AutoGen's `ChatCompletionContext` before every model turn:
 
 ```python
 from autogen_agentchat.agents import AssistantAgent
@@ -347,283 +249,73 @@ from conflux import Client
 from conflux.integrations.autogen import ConfluxAutoGenMemory, create_autogen_tools
 
 client = Client("127.0.0.1", 7001, agent_id="coder", secret="s3cr3t")
-shared_memory = ConfluxAutoGenMemory(client, state_watch_prefix="team.")
-shared_tools = create_autogen_tools(client, namespace="team.")
-
 agent = AssistantAgent(
     name="coder",
     model_client=model_client,
-    memory=[shared_memory],
-    tools=shared_tools,
+    memory=[ConfluxAutoGenMemory(client, state_watch_prefix="team.")],
+    tools=create_autogen_tools(client, namespace="team."),
 )
 ```
+> Runnable demo: [`examples/autogen_shared_state.py`](examples/autogen_shared_state.py)
 
-Runnable example: [`examples/autogen_shared_state.py`](examples/autogen_shared_state.py)
+---
 
-### MCP Server: Claude Code, Cursor, Windsurf (`conflux-mcp`)
+## 🛡️ Security, Durability & Benchmarks
 
-Conflux ships a zero-dependency **Model Context Protocol (MCP)** stdio server
-(`conflux.mcp` / `conflux-mcp` CLI) so multiple parallel coding or research
-agents can share CRDT counters, registers, sets, and task queues in real time.
-
-Add to your Claude Desktop, Claude Code, or Cursor `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "conflux": {
-      "command": "conflux-mcp",
-      "args": ["--agent-id", "claude-1", "--data", "./.conflux-mcp"]
-    }
-  }
-}
-```
-
-Or connect multiple MCP agent sessions across machines to a shared `conflux-server` mesh:
-
-```json
-{
-  "mcpServers": {
-    "conflux": {
-      "command": "conflux-mcp",
-      "args": ["--agent-id", "cursor-worker-2", "--connect", "127.0.0.1:7001", "--secret", "s3cr3t"]
-    }
-  }
-}
-```
-
-Exposed MCP tools: `conflux_read`, `conflux_snapshot`, `conflux_register_set`,
-`conflux_counter_add`, `conflux_set_add`, `conflux_set_remove`, and
-`conflux_task_update`, plus the live `conflux://state/snapshot` MCP resource.
-
-## Publishing to PyPI (Trusted Publishing / OIDC)
-
-Conflux is packaged as **`conflux-state`** on PyPI (imported as `conflux`) and
-ships ready-to-use GitHub Actions workflows in
-[`docs/github-workflows/publish.yml`](docs/github-workflows/publish.yml) and
-[`docs/github-workflows/ci.yml`](docs/github-workflows/ci.yml) using PyPI
-Trusted Publishing (OIDC — no long-lived API tokens required):
-
-1. Move or copy the workflows into `.github/workflows/`:
-   ```bash
-   mkdir -p .github/workflows && cp docs/github-workflows/*.yml .github/workflows/
-   ```
-2. On [pypi.org/manage/account/publishing/](https://pypi.org/manage/account/publishing/),
-   add a **Pending Publisher**:
-   - **PyPI Project Name**: `conflux-state`
-   - **Owner**: `lolllll212`
-   - **Repository name**: `Conflux`
-   - **Workflow name**: `publish.yml`
-   - **Environment name**: `pypi`
-3. Tag and push a release (or publish a GitHub Release):
-   ```bash
-   git tag v0.8.0 && git push origin v0.8.0
-   ```
-   GitHub Actions runs the full test suite, verifies the wheel + sdist via
-   `twine check --strict`, and publishes `conflux-state` to PyPI automatically.
-
-## Operations: metrics, admin stats, benchmarks
-
-Every server exposes a live `metrics()` dict — absorbed/submitted actions,
-journal length, links, outbound dials, discovered peers, known members, uptime,
-current `state_hash` — and answers the wire query `{"type": "admin", "what": "stats"}`
-with the same payload, so monitoring can poll nodes without a driver agent.
-
-For Prometheus, the same data is rendered in text exposition format — no
-dependencies — and served three ways: `Server.prometheus()`, the wire query
-`{"type": "admin", "what": "prometheus"}` (returns the body over the framed
-connection), and an embedded stdlib HTTP listener:
-
-```bash
-python -m conflux.server --id alpha --listen 127.0.0.1:7001 --metrics-http
-# -> metrics http on http://127.0.0.1:<ephemeral>/metrics
-```
+### Cryptographic Authority & Namespace Sandboxing
+Equip any `Server` with an `AgentRegistry` to enforce **HMAC-SHA256** (zero deps) or **Ed25519** signatures, operation allowlists, write quotas, and key-prefix namespaces *before* an action ever merges:
 
 ```python
-server = Server("alpha", ("127.0.0.1", 7001)).start()
-server.start_metrics_http("0.0.0.0", 9101)   # scrape http://<node>:9101/metrics
+from conflux import AgentRegistry, Client, Server
+
+registry = AgentRegistry()
+registry.register(
+    "billing-agent",
+    secret="hmac-secret-key",
+    ops={"counter_inc", "mv_set", "lww_set"},
+    namespaces=("billing.",),
+    quota=1000,
+)
+
+server = Server("alpha", ("127.0.0.1", 7001), registry=registry, data_dir="./data/alpha").start()
 ```
 
-Counters (`conflux_actions_absorbed_total`, `..._submitted_total`) and gauges
-(links, outbound, peers, discovered, members, journal_actions, uptime,
-state-hash info label) are labeled with `node_id`:
+### Networked CLI Cluster + TLS + Signed Journals + Prometheus
+```bash
+# Start Node Alpha with TLS, HMAC-signed tamper-evident journal, and Prometheus /metrics
+conflux-server --id alpha --listen 0.0.0.0:7001 \
+    --cert ./cert.pem --key ./key.pem \
+    --journal-key "$(openssl rand -hex 16)" \
+    --data ./data/alpha --metrics-http
+
+# Start Node Beta peered with Alpha over WebSocket (--transport ws) or TCP
+conflux-server --id beta --listen 0.0.0.0:7002 \
+    --peers 127.0.0.1:7001 --data ./data/beta
+```
+
+### Measured Throughput (`python benchmarks/bench.py`)
+- **~168,000 actions/sec** deterministic local journal replay
+- **~38,000 actions/sec** full-mesh in-memory cluster convergence
+- **~0.13 ms** single-agent `submit → fsync → ack` round-trip over TCP (**~0.17 ms** over RFC6455 WebSocket)
+
+Full formal protocol bounds and security review:
+- 📄 [**Protocol Specification (`docs/PROTOCOL.md`)**](docs/PROTOCOL.md) — wire framing, lattice join laws, probabilistic hash scale, snapshot compaction, and test conformance index.
+- 🔒 [**Security Threat Model (`docs/SECURITY.md`)**](docs/SECURITY.md) — constant-time signature verification, algorithm binding, replay idempotence, and keyless-reload refusal.
+
+---
+
+## 🧪 Running the Test Suite & Demos
 
 ```bash
-python benchmarks/bench.py            # replay, cluster, tcp + ws round-trips
-python benchmarks/bench.py --quick    # small sizes for CI
+python -m pytest                              # 123 conformance, security, integration & MCP tests
+python examples/agent_crew_demo.py            # 6 signed agents + crash + torn journal + auto-heal
+python examples/langgraph_shared_state.py     # Cross-node StateGraph pause & resume
+python examples/crewai_shared_memory.py       # Signed 2-node TCP CrewAI memory & flow persistence
+python examples/autogen_shared_state.py       # AutoGen context injection & CRDT tools
 ```
 
-Example (previous run, this machine): ~168k actions/s journal replay,
-~38k actions/s full-mesh cluster convergence, ~0.13 ms single-agent
-submit→ack round-trip over TCP and ~0.17 ms over WebSocket.
+---
 
-The real agent-state app, in one file: `examples/agent_crew_demo.py` — six
-signed agents share state (`crew.work_done`, check-in set, leader slot) across
-a 3-node mesh, then put the runtime through the failure model it was hardened
-for: a hard crash, continued writes through the partition, restart from the
-signed snapshot + journal tail, keyless reload refused, and an out-of-namespace
-write refused with no state mutation. `examples/durable_crew_demo.py` shows the
-same crash-recovery cycle on a single agent. Supporting demos:
-`examples/workflow_demo.py` (tasks/events/watchers over a cluster) and
-`examples/deploy_multi_node.py` (signed Ed25519 crews over TCP and WS meshes).
+## 📜 License
 
-## Backend: networked, persistent nodes
-
-The reference implementation ships with a multi-node backend so agents in
-different processes (or different machines) can converge. Two transports are
-built in: the default framed TCP and `--transport ws`, a dependency-free
-RFC6455 WebSocket transport (`conflux.websocket`). Set `transport="ws"` on the
-`Server`/`Client` to use it.
-
-### Run a node
-
-```bash
-python -m conflux.server --id alpha --listen 127.0.0.1:7001 --data ./data/alpha
-python -m conflux.server --id beta --listen 127.0.0.1:7002 --peers 127.0.0.1:7001 --data ./data/beta
-```
-
-Use `--peers host:port,host:port` to list neighbors. Gossip links are
-bidirectional once established, and each node replays its persisted journal on
-startup.
-
-### TLS framing (tls:// and wss://)
-
-Pass a PEM certificate to encrypt every socket with the stdlib `ssl` module —
-both the framed TCP transport and the RFC6455 WebSocket transport, for agent
-clients and peer-to-peer gossip alike:
-
-```bash
-python -m conflux.server --id alpha --listen 127.0.0.1:7001 \
-    --cert ./cert.pem --key ./key.pem --data ./data/alpha
-```
-
-```python
-server = Server("alpha", ("127.0.0.1", 7001), tls=("cert.pem", "key.pem")).start()
-client = Client("127.0.0.1", 7001, tls=("cert.pem", "key.pem", "cert.pem"))  # ca = 3rd element
-```
-
-Omitting the CA in the client's `tls=` tuple disables peer verification (self-signed
-clusters); `tls=True` uses the system CAs, and `tls="ca.pem"` verifies against that CA.
-
-### Membership and partitions
-
-Peers announce their node id, address, peer list, and member view on
-handshake; every server maintains a `members` view (see `metrics()["members"]`
-and `members_view()`). When a neighbor dies, the receive loop drops the link
-and the gossip loop re-dials it with exponential backoff. Links that go silent
-without closing (a hung or partitioned peer) are liveness-checked and dropped
-after `--stale-after` seconds (default 3× `gossip_interval`), then re-dialed —
-so a healed partition re-converges automatically once the peer is reachable
-again (see `tests/test_phase4.py::test_partition_reconnect`).
-
-### Signed, compacted journals
-
-```bash
-python -m conflux.server --id alpha --listen 127.0.0.1:7001 \
-    --cert ./cert.pem --key ./key.pem --journal-key "$(openssl rand -hex 16)" --data ./data/alpha
-```
-
-Every journal line carries `"sig"` — an HMAC-SHA256 over the canonical action
-bytes — and every snapshot carries the same over its `{seq, root}` payload.
-Replay verifies both; a tampered log or snapshot raises instead of silently
-restoring a corrupt state. Snapshots are **cumulative**: each compaction folds
-the current root into the previous generation via the lattice join and emits a
-single merged summary, pruning older generations, so a crash mid-history never
-loses committed state.
-
-### Write and read from an agent
-
-```python
-from conflux import Client
-
-client = Client("127.0.0.1", 7001, agent_id="agent-42")
-client.counter_inc("bookings.seats", 2)
-client.register_set("flight.eta", "14:05")
-client.set_add("tickets", "TK-100", tag="tk-100")
-print(client.read("bookings.seats"))          # 2
-print(client.hash())                          # 64-hex SHA-256 of canonical state
-
-# Batch multiple mutations in a single atomic round-trip:
-with client.batch() as b:
-    b.counter_inc("bookings.seats", 1)
-    b.register_set("flight.status", "boarding")
-
-client.close()
-```
-
-### Durability
-
-Each absorbed action is appended to `data/<node>/journal.jsonl` immediately.
-When the journal passes the snapshot threshold, the current CRDT root is merged
-(lattice join) into the previous generation's root and written atomically —
-both as `snapshot-<seq>.json` (generation) and `snapshot.json` (latest alias) —
-after which the log is truncated and older generations are pruned. A node never
-replays a tail older than what its cumulative snapshot already captures, and a
-crash mid-rotation degrades to the newest untampered generation. Optional
-`--journal-key` HMAC-signs every line and snapshot, and replay refuses
-tampered files. State values travel on the wire as JSON; register/set values
-must be JSON-serializable.
-
-## Guarantees and limits
-
-Conflux promises, and the test suite verifies:
-
-- **Eventually consistent convergence**: every node that has absorbed the union of
-  available actions shows identical state (same `state_hash`), regardless of
-  delivery order.
-- **No global lock, no blocking writes**: agents write to their own replicas
-  concurrently; merging is a join, so writers never contend.
-- **Deterministic merges**: identical action sets always yield identical state,
-  including tie-breaks (equal stamps/tags) resolved by canonical order.
-- **Replayability**: any subset of the journal rebuilds exactly the same state.
-- **Durable ack**: a submit is acknowledged only after the accepting node has
-  absorbed the actions and fsynced them to its journal; an acked action
-  survives that node's process crash (torn-tail recovery).
-
-The exact limits — schema bounds, frame size, snapshot/gossip/stale defaults,
-backoff schedule, quota rules, and measured throughput (≈24k actions/s local
-replay, ≈2.8k actions/s across an 8-agent TCP cluster) — are pinned in
-[`docs/PROTOCOL.md` §8](docs/PROTOCOL.md); re-run `benchmarks/bench.py` for
-host-local figures.
-
-Honest limits:
-
-- **Stale reads**: a read observes the join of everything that node has gossiped
-  so far. Convergence is eventual, not linearizable; workflows that need
-  strictly ordered reads need an external sequencing channel.
-- **One type per key**: merging a key's existing CRDT with a different CRDT type
-  raises `TypeError` — a deterministic schema contract, not an ambiguity.
-- **Unique IDs are load-bearing**: `action_id` and set tags are event identities;
-  reuse silently merges (so agent ids must be process-unique and ticks monotonic).
-- **Fixed-point weights**: probabilistic decisions use a fixed 32-bit scale over
-  the same serialized `weight`, so all replicas agree as long as `weight` is a
-  JSON number.
-
-## Roadmap -> status
-
-Phase 1 (protocol foundations), Phase 2 (cluster runtime), Phase 3 (application
-layer), and the Phase 4 operational surface (metrics/admin probe, Prometheus
-exporter, benchmarks, TLS, signed journals, membership/partition handling,
-cumulative compaction) are complete.
-
-The remaining ideas in each phase are **backlog, deliberately out of scope**
-under the current product definition (§"Product definition and scope"): secure
-framing beyond TLS, multi-cluster federation, chunked cross-peer snapshot
-exchange, OpenTelemetry exporters, and workflow orchestration expansion. Each
-is a candidate to revisit only after the core fabric — determinism, durability,
-crash recovery — is proven by adopters.
-
-## Security
-
-The cryptographic signing, identity verification, and storage subsystems are
-documented in [`docs/SECURITY.md`](docs/SECURITY.md): threat model and trust
-boundary, the properties the implementation enforces (constant-time
-verification, algorithm binding, canonical serialization, signer binding,
-replay idempotence, keyless-reload refusal), the findings that remain open,
-and a deployment checklist. To report a vulnerability, open a GitHub issue or
-contact the maintainer privately as described there.
-
-## License
-
-Conflux is released under the [MIT License](LICENSE), as declared in
-`pyproject.toml`.
+Released under the [MIT License](LICENSE). Built for deterministic, resilient multi-agent systems.

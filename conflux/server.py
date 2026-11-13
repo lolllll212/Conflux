@@ -139,6 +139,14 @@ class Server:
         with self.lock:
             return self.replica.read(key)
 
+    def conflicts(self, prefix=None):
+        with self.lock:
+            return self.replica.conflicts(prefix=prefix)
+
+    def candidates(self, key):
+        with self.lock:
+            return self.replica.candidates(key)
+
     def subscribe(self, handler, op=None, key=None, key_prefix=None):
         return self.events.subscribe(handler, op=op, key=key, key_prefix=key_prefix)
 
@@ -349,6 +357,10 @@ class Server:
             send({"type": "read_resp", "key": msg["key"], "value": to_wire(self.read(msg["key"]))})
         elif msg.get("type") == "read_all":
             send({"type": "read_resp", "value": to_wire(self.view())})
+        elif msg.get("type") == "conflicts":
+            send({"type": "conflicts_resp", "value": to_wire(self.conflicts(msg.get("prefix")))})
+        elif msg.get("type") == "candidates":
+            send({"type": "candidates_resp", "key": msg["key"], "value": to_wire(self.candidates(msg["key"]))})
         elif msg.get("type") == "hash":
             send({"type": "hash_resp", "hash": self.hash()})
         elif msg.get("type") == "sync":

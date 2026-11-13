@@ -1,5 +1,13 @@
-from .actions import Action, OP_COUNTER_DEC, OP_COUNTER_INC, OP_LWW_SET, OP_ORSET_ADD, OP_ORSET_REMOVE
-from .crdts import ORMap
+from .actions import (
+    Action,
+    OP_COUNTER_DEC,
+    OP_COUNTER_INC,
+    OP_LWW_SET,
+    OP_MV_SET,
+    OP_ORSET_ADD,
+    OP_ORSET_REMOVE,
+)
+from .crdts import MVRegister, ORMap
 
 
 class State:
@@ -15,6 +23,23 @@ class State:
 
     def read(self, key):
         return self._map.read(key)
+
+    def candidates(self, key):
+        crdt = self._map.get(key)
+        if isinstance(crdt, MVRegister):
+            return crdt.candidates()
+        return []
+
+    def conflicts(self, prefix=None):
+        """Return a mapping of keys to concurrent candidate lists for any MVRegister with 2+ distinct values."""
+        out = {}
+        for key in sorted(self._map.keys()):
+            if prefix is not None and not key.startswith(prefix):
+                continue
+            crdt = self._map.get(key)
+            if isinstance(crdt, MVRegister) and crdt.has_conflict():
+                out[key] = crdt.candidates()
+        return out
 
     def view(self):
         return {key: self._map.read(key) for key in sorted(self._map.keys())}
@@ -46,6 +71,33 @@ class Replica:
 
     def register_set_weighted(self, key, value, weight):
         return self._emit(OP_LWW_SET, key, {"value": value, "weight": weight})
+
+    def mv_set(self, key, value, supersedes=None):
+        """Write to a conflict-preserving Multi-Value Register.
+
+        If ``supersedes`` is omitted, automatically supersedes the dots this
+        replica has ALREADY observed locally on ``key`` — so sequential local
+        writes replace prior values cleanly, whereas concurrent writes from
+        un-synced peers are BOTH preserved as conflicts until resolved!
+        """
+        if supersedes is None:
+            existing = self.state._map.get(key)
+            supersedes = list(existing.active_dots()) if isinstance(existing, MVRegister) else []
+        else:
+            supersedes = [str(s) for s in supersedes]
+        return self._emit(OP_MV_SET, key, {"value": value, "supersedes": supersedes})
+
+    def mv_resolve(self, key, resolved_value):
+        """Causally resolve all currently observed concurrent candidates on ``key`` into ``resolved_value``."""
+        existing = self.state._map.get(key)
+        dots = list(existing.active_dots()) if isinstance(existing, MVRegister) else []
+        return self._emit(OP_MV_SET, key, {"value": resolved_value, "supersedes": dots})
+
+    def conflicts(self, prefix=None):
+        return self.state.conflicts(prefix=prefix)
+
+    def candidates(self, key):
+        return self.state.candidates(key)
 
     def set_add(self, key, value, tag=None):
         return self._emit(OP_ORSET_ADD, key, {"value": value, "tag": tag or self._next_tag()})

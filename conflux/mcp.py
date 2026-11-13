@@ -1,32 +1,24 @@
 """Zero-dependency Model Context Protocol (MCP) server for Conflux.
 
-Exposes Conflux's lock-free CRDT state fabric over standard MCP JSON-RPC 2.0
-(stdio transport, newline-delimited + Content-Length framing support) so
-Claude Code, Claude Desktop, Cursor, Windsurf, Cline, and any MCP client can
-share convergent state across parallel coding/research agents.
+Exposes Conflux's lock-free CRDT state fabric — including **conflict-preserving
+Multi-Value Registers (`MVRegister`)**, **conflict detection & resolution**,
+**lease-based file/resource claims**, **reactive key watching**, and **MCP
+Prompts + Resources + Resource Templates** — over standard MCP JSON-RPC 2.0
+(stdio transport, supporting both newline-delimited JSON and ``Content-Length``
+framing).
+
+Works seamlessly with Claude Code, Claude Desktop, Cursor, Windsurf, Cline,
+and any MCP-compliant agent orchestrator.
 
 Two deployment modes via ``conflux-mcp`` CLI:
 
-1. **Networked mesh mode (`--connect host:port`)**:
+1. **Networked mesh mode (``--connect host:port``)**:
    Connects as a signed or unsigned ``Client`` to a live ``conflux-server``
    mesh so multiple MCP agent processes converge in real time.
 
-2. **Standalone durable mode (`--data ./dir` or in-memory)**:
-   Starts an embedded ``Server`` (optional TCP listener + peer list + disk
-   journal) so a local multi-agent team can coordinate with zero setup.
-
-Example Claude Desktop / Cursor MCP config (``mcp.json``):
-
-.. code-block:: json
-
-    {
-      "mcpServers": {
-        "conflux": {
-          "command": "conflux-mcp",
-          "args": ["--agent-id", "claude-1", "--data", "./.conflux-mcp"]
-        }
-      }
-    }
+2. **Standalone durable mode (``--data ./dir`` or ``--listen host:port``)**:
+   Starts an embedded ``Server`` (optional TCP/WS listener + peer list + disk
+   journal) so a local multi-agent team coordinates with zero setup.
 """
 
 from __future__ import annotations
@@ -34,16 +26,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, BinaryIO, TextIO
+import time
+from typing import Any, BinaryIO
 
 from . import __version__
-from .app import TaskStore
 from .client import Client
 from .integrations.base import BackendAdapter, coerce_backend
 from .server import Server
 from .state import Replica
 
-LATEST_PROTOCOL_VERSION = "2024-11-05"
+LATEST_PROTOCOL_VERSION = "2025-03-26"
 
 
 def _json_safe(value: Any) -> Any:
@@ -61,14 +53,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "name": "conflux_read",
         "description": (
             "Read the current converged value of a shared CRDT key "
-            "(PNCounter integer, LWWRegister JSON value, or ORSet list)."
+            "(PNCounter int, LWWRegister JSON value, MVRegister winning value + active conflicts, or ORSet list)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Shared state key (e.g. 'fleet.jobs_done' or 'plan.leader').",
+                    "description": "Shared state key (e.g. 'fleet.jobs_done' or 'arch.decision').",
                 }
             },
             "required": ["key"],
@@ -78,7 +70,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "name": "conflux_snapshot",
         "description": (
             "Return a full JSON snapshot of all shared CRDT keys (optionally filtered "
-            "by prefix) together with the canonical 64-hex SHA-256 state_hash."
+            "by prefix), active MVRegister conflict count, and the canonical 64-hex SHA-256 state_hash."
         ),
         "inputSchema": {
             "type": "object",
@@ -108,6 +100,58 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "conflux_mv_write",
+        "description": (
+            "Write a JSON value to a conflict-preserving Multi-Value Register (MVRegister). "
+            "Sequential writes cleanly replace prior values, while un-synced concurrent writes "
+            "from parallel agents are BOTH preserved in conflux_conflicts until resolved!"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "MVRegister key (e.g. 'spec.api_schema')."},
+                "value": {"description": "JSON-serializable value proposed by this agent."},
+                "supersedes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of 'tick:agent' dots to supersede (defaults to all currently observed dots on this replica).",
+                },
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "conflux_conflicts",
+        "description": (
+            "List all unresolved concurrent write conflicts across MVRegister keys, showing "
+            "every competing agent's candidate value, causal dot ('tick:agent'), and current canonical winner."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prefix": {
+                    "type": "string",
+                    "description": "Optional key prefix to filter conflicts.",
+                }
+            },
+        },
+    },
+    {
+        "name": "conflux_resolve_conflict",
+        "description": (
+            "Causally resolve all currently observed concurrent MVRegister candidates on 'key' "
+            "into a single merged/agreed JSON value, clearing the conflict across the mesh."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Conflicted MVRegister key to resolve."},
+                "resolved_value": {"description": "Merged/agreed JSON value superseding all prior candidates."},
+            },
+            "required": ["key", "resolved_value"],
+        },
+    },
+    {
         "name": "conflux_counter_add",
         "description": (
             "Atomically increment (delta > 0) or decrement (delta < 0) a lock-free "
@@ -128,9 +172,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "conflux_set_add",
-        "description": (
-            "Add an item to a conflict-free Observed-Remove Set (ORSet) in shared state."
-        ),
+        "description": "Add an item to a conflict-free Observed-Remove Set (ORSet) in shared state.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -138,7 +180,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "value": {"description": "JSON-serializable element to add."},
                 "tag": {
                     "type": "string",
-                    "description": "Optional unique tag (defaults to auto-generated monotonic agent tag); save this tag if you plan to remove the item later.",
+                    "description": "Optional unique tag (save this tag if you plan to remove the item later).",
                 },
             },
             "required": ["key", "value"],
@@ -157,10 +199,111 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "conflux_batch",
+        "description": (
+            "Execute multiple CRDT mutations sequentially in one tool call "
+            "(ops: register_set, mv_write, counter_add, set_add, set_remove)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "description": "List of mutation specs: {op, key, value/delta/tag}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": [
+                                    "register_set",
+                                    "mv_write",
+                                    "counter_add",
+                                    "set_add",
+                                    "set_remove",
+                                ],
+                            },
+                            "key": {"type": "string"},
+                            "value": {},
+                            "delta": {"type": "integer"},
+                            "tag": {"type": "string"},
+                        },
+                        "required": ["op", "key"],
+                    },
+                }
+            },
+            "required": ["operations"],
+        },
+    },
+    {
+        "name": "conflux_claim_resource",
+        "description": (
+            "Advisory file/task claim with TTL lease so parallel coding agents (Claude Code, Cursor) "
+            "avoid editing the same file simultaneously. Reports 'conflict' if another agent holds an active lease."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource": {
+                    "type": "string",
+                    "description": "File path or resource identifier (e.g. 'src/auth.py').",
+                },
+                "ttl_seconds": {
+                    "type": "number",
+                    "description": "Lease duration in seconds before automatic expiry (default 120).",
+                    "default": 120,
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Short note describing what this agent is doing with the resource.",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Steal the claim even if another agent's lease has not expired yet.",
+                    "default": False,
+                },
+            },
+            "required": ["resource"],
+        },
+    },
+    {
+        "name": "conflux_release_resource",
+        "description": "Release an advisory resource/file lease previously claimed by this agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string", "description": "File path or resource identifier."}
+            },
+            "required": ["resource"],
+        },
+    },
+    {
+        "name": "conflux_watch_wait",
+        "description": (
+            "Wait up to timeout_seconds until 'key' changes from 'since_value' (or becomes non-null), "
+            "enabling event-driven handoffs between parallel MCP agents."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key to watch."},
+                "since_value": {
+                    "description": "Return immediately once current value differs from since_value."
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "description": "Max seconds to wait (capped at 30s).",
+                    "default": 2.0,
+                },
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "conflux_task_update",
         "description": (
             "Create or update a replicated multi-agent task record under 'tasks/<task_id>' "
-            "(status: created | running | done | failed) so parallel agents can coordinate work queues."
+            "(status: created | running | done | failed) so parallel agents coordinate work queues."
         ),
         "inputSchema": {
             "type": "object",
@@ -186,8 +329,40 @@ MCP_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+MCP_PROMPTS: list[dict[str, Any]] = [
+    {
+        "name": "resolve_state_conflicts",
+        "description": (
+            "Inspect all active Conflux MVRegister conflicts and guide the LLM agent "
+            "to synthesize and commit a conflict-free merged value."
+        ),
+        "arguments": [
+            {
+                "name": "prefix",
+                "description": "Optional key prefix to scope conflict inspection.",
+                "required": False,
+            }
+        ],
+    },
+    {
+        "name": "coordinate_parallel_swarm",
+        "description": (
+            "Bootstrap a parallel multi-agent coding/research session with Conflux "
+            "file-claim leases, shared counters, and MVRegister conflict hygiene."
+        ),
+        "arguments": [
+            {
+                "name": "goal",
+                "description": "High-level team objective for the agent crew.",
+                "required": False,
+            }
+        ],
+    },
+]
+
+
 class ConfluxMCPServer:
-    """MCP JSON-RPC 2.0 dispatcher backed by any Conflux runtime object."""
+    """Full-featured MCP JSON-RPC 2.0 server backed by any Conflux runtime object."""
 
     def __init__(self, backend: Any, *, namespace: str = "", server_name: str = "conflux-state"):
         self.backend: BackendAdapter = coerce_backend(backend)
@@ -204,19 +379,33 @@ class ConfluxMCPServer:
     # ------------------------------------------------------------------
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         args = dict(arguments or {})
+
         if name == "conflux_read":
             qkey = self._qualify(str(args["key"]))
             val = _json_safe(self.backend.read(qkey))
-            return {"key": qkey, "value": val, "state_hash": self.backend.hash()}
+            cands = self.backend.candidates(qkey)
+            resp: dict[str, Any] = {
+                "key": qkey,
+                "value": val,
+                "state_hash": self.backend.hash(),
+            }
+            if cands:
+                distinct = {json.dumps(_json_safe(c["value"]), sort_keys=True) for c in cands}
+                resp["has_conflict"] = len(distinct) > 1
+                resp["candidates"] = _json_safe(cands)
+            return resp
 
         if name == "conflux_snapshot":
             raw_prefix = args.get("prefix")
             prefix = self._qualify(str(raw_prefix)) if raw_prefix else (self.namespace or None)
             view = _json_safe(self.backend.view(prefix=prefix))
+            conflicts = _json_safe(self.backend.conflicts(prefix=prefix))
             return {
                 "agent_id": self.backend.agent_id,
                 "state_hash": self.backend.hash(),
                 "keys": len(view),
+                "conflict_count": len(conflicts),
+                "conflicts": conflicts,
                 "state": view,
             }
 
@@ -229,6 +418,55 @@ class ConfluxMCPServer:
                 "action_id": action.action_id,
                 "key": qkey,
                 "value": _json_safe(self.backend.read(qkey)),
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_mv_write":
+            qkey = self._qualify(str(args["key"]))
+            supersedes = args.get("supersedes")
+            action = self.backend.mv_set(qkey, args["value"], supersedes=supersedes)
+            cands = self.backend.candidates(qkey)
+            distinct = {json.dumps(_json_safe(c["value"]), sort_keys=True) for c in cands}
+            return {
+                "status": "ok",
+                "action_id": action.action_id,
+                "dot": f"{action.tick}:{action.agent}",
+                "key": qkey,
+                "winner": _json_safe(self.backend.read(qkey)),
+                "has_conflict": len(distinct) > 1,
+                "candidates": _json_safe(cands),
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_conflicts":
+            raw_prefix = args.get("prefix")
+            prefix = self._qualify(str(raw_prefix)) if raw_prefix else (self.namespace or None)
+            conflicts = self.backend.conflicts(prefix=prefix)
+            formatted = {
+                k: {
+                    "winner": _json_safe(self.backend.read(k)),
+                    "candidate_count": len(cands),
+                    "candidates": _json_safe(cands),
+                }
+                for k, cands in conflicts.items()
+            }
+            return {
+                "conflict_count": len(formatted),
+                "conflicts": formatted,
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_resolve_conflict":
+            qkey = self._qualify(str(args["key"]))
+            before_cands = self.backend.candidates(qkey)
+            action = self.backend.mv_resolve(qkey, args["resolved_value"])
+            return {
+                "status": "resolved",
+                "action_id": action.action_id,
+                "key": qkey,
+                "superseded_dots": [c["dot"] for c in before_cands],
+                "value": _json_safe(self.backend.read(qkey)),
+                "has_conflict": len(self.backend.conflicts(prefix=qkey)) > 0,
                 "state_hash": self.backend.hash(),
             }
 
@@ -274,6 +512,127 @@ class ConfluxMCPServer:
                 "state_hash": self.backend.hash(),
             }
 
+        if name == "conflux_batch":
+            operations = list(args.get("operations") or [])
+            applied = []
+            for spec in operations:
+                op = spec["op"]
+                key = spec["key"]
+                if op == "register_set":
+                    res = self.call_tool("conflux_register_set", {"key": key, "value": spec["value"]})
+                elif op == "mv_write":
+                    res = self.call_tool("conflux_mv_write", {"key": key, "value": spec["value"]})
+                elif op == "counter_add":
+                    res = self.call_tool(
+                        "conflux_counter_add", {"key": key, "delta": spec.get("delta", 1)}
+                    )
+                elif op == "set_add":
+                    res = self.call_tool(
+                        "conflux_set_add",
+                        {"key": key, "value": spec["value"], "tag": spec.get("tag")},
+                    )
+                elif op == "set_remove":
+                    res = self.call_tool("conflux_set_remove", {"key": key, "tag": spec["tag"]})
+                else:
+                    raise ValueError(f"unsupported batch op {op!r}")
+                applied.append({"op": op, "key": res["key"], "action_id": res["action_id"]})
+            return {
+                "status": "ok",
+                "applied_count": len(applied),
+                "applied": applied,
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_claim_resource":
+            resource = str(args["resource"])
+            ttl = float(args.get("ttl_seconds", 120.0))
+            force = bool(args.get("force", False))
+            intent = str(args.get("intent") or "")
+            claim_key = self._qualify(f"claims/{resource}")
+            now = time.time()
+
+            current = self.backend.read(claim_key)
+            if (
+                isinstance(current, dict)
+                and current.get("status") == "claimed"
+                and current.get("owner") != self.backend.agent_id
+                and float(current.get("expires_at", 0.0)) > now
+                and not force
+            ):
+                return {
+                    "status": "conflict",
+                    "acquired": False,
+                    "resource": resource,
+                    "held_by": current.get("owner"),
+                    "holder_intent": current.get("intent", ""),
+                    "seconds_remaining": round(float(current["expires_at"]) - now, 2),
+                    "state_hash": self.backend.hash(),
+                }
+
+            lease = {
+                "resource": resource,
+                "status": "claimed",
+                "owner": self.backend.agent_id,
+                "intent": intent,
+                "claimed_at": round(now, 3),
+                "expires_at": round(now + ttl, 3),
+            }
+            self.backend.register_set(claim_key, lease)
+            return {
+                "status": "claimed",
+                "acquired": True,
+                "lease": lease,
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_release_resource":
+            resource = str(args["resource"])
+            claim_key = self._qualify(f"claims/{resource}")
+            current = self.backend.read(claim_key)
+            if (
+                isinstance(current, dict)
+                and current.get("status") == "claimed"
+                and current.get("owner") not in (None, self.backend.agent_id)
+            ):
+                return {
+                    "status": "conflict",
+                    "released": False,
+                    "reason": f"resource {resource!r} is owned by {current.get('owner')!r}",
+                    "state_hash": self.backend.hash(),
+                }
+            released = {
+                "resource": resource,
+                "status": "released",
+                "owner": None,
+                "released_by": self.backend.agent_id,
+                "released_at": round(time.time(), 3),
+            }
+            self.backend.register_set(claim_key, released)
+            return {
+                "status": "released",
+                "released": True,
+                "resource": resource,
+                "state_hash": self.backend.hash(),
+            }
+
+        if name == "conflux_watch_wait":
+            qkey = self._qualify(str(args["key"]))
+            has_since = "since_value" in args
+            since_val = _json_safe(args.get("since_value"))
+            timeout = max(0.0, min(30.0, float(args.get("timeout_seconds", 2.0))))
+            deadline = time.time() + timeout
+            while True:
+                cur = _json_safe(self.backend.read(qkey))
+                changed = (cur != since_val) if has_since else (cur is not None)
+                if changed or time.time() >= deadline:
+                    return {
+                        "key": qkey,
+                        "changed": changed,
+                        "value": cur,
+                        "state_hash": self.backend.hash(),
+                    }
+                time.sleep(0.04)
+
         if name == "conflux_task_update":
             task_id = str(args["task_id"])
             status = str(args["status"])
@@ -298,6 +657,45 @@ class ConfluxMCPServer:
         raise KeyError(f"unknown tool: {name}")
 
     # ------------------------------------------------------------------
+    # Prompts builder
+    # ------------------------------------------------------------------
+    def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        args = dict(arguments or {})
+        if name == "resolve_state_conflicts":
+            conflicts_payload = self.call_tool("conflux_conflicts", {"prefix": args.get("prefix")})
+            text = (
+                "Inspect the active Conflux Multi-Value Register conflicts below. "
+                "For each conflicted key, compare every agent's candidate value and causal dot, "
+                "synthesize the correct merged value, and call `conflux_resolve_conflict` "
+                "so all replicas converge cleanly:\n\n"
+                f"{json.dumps(conflicts_payload, indent=2, sort_keys=True)}"
+            )
+            return {
+                "description": "Resolve concurrent MVRegister conflicts across agents.",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+
+        if name == "coordinate_parallel_swarm":
+            goal = args.get("goal") or "Collaborate safely without overwriting peer agent work."
+            snap = self.call_tool("conflux_snapshot", {})
+            text = (
+                f"You are agent `{self.backend.agent_id}` connected to a shared Conflux CRDT state mesh.\n"
+                f"Team objective: {goal}\n\n"
+                "Coordination protocol:\n"
+                "1. Before editing a shared file/module, call `conflux_claim_resource` to acquire a TTL lease.\n"
+                "2. Use `conflux_mv_write` for shared specs/decisions where concurrent edits must be preserved rather than overwritten.\n"
+                "3. Periodically check `conflux_conflicts` and resolve divergences with `conflux_resolve_conflict`.\n"
+                "4. Track progress with `conflux_counter_add` and `conflux_task_update`, and release leases via `conflux_release_resource`.\n\n"
+                f"Current mesh snapshot:\n{json.dumps(snap, indent=2, sort_keys=True)}"
+            )
+            return {
+                "description": "Swarm coordination protocol over Conflux MCP.",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+
+        raise KeyError(f"unknown prompt: {name}")
+
+    # ------------------------------------------------------------------
     # JSON-RPC 2.0 message handler
     # ------------------------------------------------------------------
     def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -317,6 +715,7 @@ class ConfluxMCPServer:
                     "capabilities": {
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
+                        "prompts": {"listChanged": False},
                     },
                     "serverInfo": {
                         "name": self.server_name,
@@ -357,6 +756,22 @@ class ConfluxMCPServer:
                         },
                     }
 
+            if method == "prompts/list":
+                return {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": MCP_PROMPTS}}
+
+            if method == "prompts/get":
+                prompt_name = params.get("name", "")
+                prompt_args = params.get("arguments") or {}
+                try:
+                    prompt_res = self.get_prompt(prompt_name, prompt_args)
+                    return {"jsonrpc": "2.0", "id": msg_id, "result": prompt_res}
+                except KeyError as exc:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {"code": -32602, "message": str(exc)},
+                    }
+
             if method == "resources/list":
                 resources = [
                     {
@@ -364,31 +779,54 @@ class ConfluxMCPServer:
                         "name": "Conflux Shared State Snapshot",
                         "description": "Live JSON snapshot and SHA-256 state_hash of all converged CRDT keys.",
                         "mimeType": "application/json",
-                    }
+                    },
+                    {
+                        "uri": "conflux://state/conflicts",
+                        "name": "Conflux Active MVRegister Conflicts",
+                        "description": "Live feed of concurrent multi-agent write conflicts awaiting causal resolution.",
+                        "mimeType": "application/json",
+                    },
                 ]
                 return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": resources}}
+
+            if method == "resources/templates/list":
+                templates = [
+                    {
+                        "uriTemplate": "conflux://key/{key}",
+                        "name": "Read Individual Conflux Key",
+                        "description": "Inspect the current CRDT value and candidate list of any key.",
+                        "mimeType": "application/json",
+                    }
+                ]
+                return {"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": templates}}
 
             if method == "resources/read":
                 uri = params.get("uri", "")
                 if uri == "conflux://state/snapshot":
-                    snap = self.call_tool("conflux_snapshot", {})
+                    data = self.call_tool("conflux_snapshot", {})
+                elif uri == "conflux://state/conflicts":
+                    data = self.call_tool("conflux_conflicts", {})
+                elif uri.startswith("conflux://key/"):
+                    target_key = uri[len("conflux://key/") :]
+                    data = self.call_tool("conflux_read", {"key": target_key})
+                else:
                     return {
                         "jsonrpc": "2.0",
                         "id": msg_id,
-                        "result": {
-                            "contents": [
-                                {
-                                    "uri": uri,
-                                    "mimeType": "application/json",
-                                    "text": json.dumps(snap, indent=2, sort_keys=True),
-                                }
-                            ]
-                        },
+                        "error": {"code": -32602, "message": f"Unknown resource URI: {uri}"},
                     }
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "error": {"code": -32602, "message": f"Unknown resource URI: {uri}"},
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps(data, indent=2, sort_keys=True),
+                            }
+                        ]
+                    },
                 }
 
             return {
@@ -426,7 +864,6 @@ class ConfluxMCPServer:
             if stripped.lower().startswith(b"content-length:"):
                 use_content_length = True
                 length = int(stripped.split(b":", 1)[1].strip())
-                # Consume remaining headers up to blank line
                 while True:
                     hdr = in_stream.readline()
                     if not hdr or hdr.strip() == b"":
@@ -473,7 +910,7 @@ def _split_addr(text: str) -> tuple[str, int]:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="conflux-mcp",
-        description="Conflux MCP Server — shared lock-free CRDT state for Claude, Cursor, and MCP agents.",
+        description="Conflux MCP Server — conflict-aware CRDT shared state for Claude, Cursor, and MCP agents.",
     )
     parser.add_argument("--agent-id", default="mcp-agent", help="Agent identity for signed/CRDT actions")
     parser.add_argument(

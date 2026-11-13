@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conflux-state"
-version = "0.8.1"
-description = "Deterministic, lock-free CRDT shared state protocol for concurrent AI agents, with MCP server and drop-in adapters for LangGraph, CrewAI, and AutoGen."
+version = "0.9.0"
+description = "Deterministic, conflict-aware CRDT shared state protocol for concurrent AI agents, with MCP server and drop-in adapters for LangGraph, CrewAI, and AutoGen."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
