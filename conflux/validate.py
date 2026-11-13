@@ -26,7 +26,7 @@ MAX_KEY_LENGTH = 256
 MAX_AGENT_LENGTH = 128
 MAX_ID_LENGTH = 512
 MAX_TAG_LENGTH = 512
-MAX_PARAMS_BYTES = 4096
+MAX_PARAMS_BYTES = 1_048_576  # 1 MiB per action payload (supports LangGraph/CrewAI/AutoGen state & checkpoints)
 _ID_RE = re.compile(r"^[A-Za-z0-9._:\-]+$")
 
 

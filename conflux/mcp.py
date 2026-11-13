@@ -551,7 +551,29 @@ class ConfluxMCPServer:
             claim_key = self._qualify(f"claims/{resource}")
             now = time.time()
 
+            # Read both winning value and MVRegister concurrent candidates so simultaneous
+            # cross-node claims surface a conflict rather than silently granting two leases!
             current = self.backend.read(claim_key)
+            active_cands = self.backend.candidates(claim_key)
+            for cand in active_cands:
+                cval = cand.get("value")
+                if (
+                    isinstance(cval, dict)
+                    and cval.get("status") == "claimed"
+                    and cval.get("owner") != self.backend.agent_id
+                    and float(cval.get("expires_at", 0.0)) > now
+                    and not force
+                ):
+                    return {
+                        "status": "conflict",
+                        "acquired": False,
+                        "resource": resource,
+                        "held_by": cval.get("owner"),
+                        "holder_intent": cval.get("intent", ""),
+                        "seconds_remaining": round(float(cval["expires_at"]) - now, 2),
+                        "concurrent_claims": len(active_cands) > 1,
+                        "state_hash": self.backend.hash(),
+                    }
             if (
                 isinstance(current, dict)
                 and current.get("status") == "claimed"
@@ -577,11 +599,35 @@ class ConfluxMCPServer:
                 "claimed_at": round(now, 3),
                 "expires_at": round(now + ttl, 3),
             }
-            self.backend.register_set(claim_key, lease)
+            # Use mv_set so concurrent claims across un-synced replicas preserve BOTH
+            # claimants in `conflux_conflicts` instead of silently overwriting via LWW!
+            self.backend.mv_set(claim_key, lease)
+            post_cands = self.backend.candidates(claim_key)
+            competing = [
+                c["value"]
+                for c in post_cands
+                if isinstance(c.get("value"), dict)
+                and c["value"].get("status") == "claimed"
+                and c["value"].get("owner") != self.backend.agent_id
+                and float(c["value"].get("expires_at", 0.0)) > now
+            ]
+            if competing and not force:
+                winner = self.backend.read(claim_key)
+                if isinstance(winner, dict) and winner.get("owner") != self.backend.agent_id:
+                    return {
+                        "status": "conflict",
+                        "acquired": False,
+                        "resource": resource,
+                        "held_by": winner.get("owner"),
+                        "holder_intent": winner.get("intent", ""),
+                        "concurrent_claims": True,
+                        "state_hash": self.backend.hash(),
+                    }
             return {
                 "status": "claimed",
                 "acquired": True,
                 "lease": lease,
+                "concurrent_claims": bool(competing),
                 "state_hash": self.backend.hash(),
             }
 
@@ -607,7 +653,7 @@ class ConfluxMCPServer:
                 "released_by": self.backend.agent_id,
                 "released_at": round(time.time(), 3),
             }
-            self.backend.register_set(claim_key, released)
+            self.backend.mv_resolve(claim_key, released)
             return {
                 "status": "released",
                 "released": True,

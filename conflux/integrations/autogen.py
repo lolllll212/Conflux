@@ -290,10 +290,45 @@ def create_autogen_tools(backend: Any, *, namespace: str = "team.") -> list[Any]
         }
         return json.dumps({"state_hash": adapter.hash(), "state": serializable})
 
+    def conflux_mv_write(key: str, value: str) -> str:
+        """Write a string or JSON value to a conflict-preserving Multi-Value Register (MVRegister)."""
+        qkey = _qualify(key)
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            parsed = value
+        adapter.mv_set(qkey, parsed)
+        cands = adapter.candidates(qkey)
+        return json.dumps(
+            {
+                "status": "ok",
+                "key": qkey,
+                "value": adapter.read(qkey),
+                "has_conflict": len(cands) > 1,
+                "candidates": cands,
+            }
+        )
+
+    def conflux_conflicts(prefix: str = "") -> str:
+        """Inspect all active concurrent multi-agent write conflicts in shared Conflux state."""
+        search_prefix = _qualify(prefix) if prefix else (ns or None)
+        conflicts = adapter.conflicts(prefix=search_prefix)
+        return json.dumps({"conflict_count": len(conflicts), "conflicts": conflicts})
+
+    def conflux_resolve_conflict(key: str, resolved_value: str) -> str:
+        """Causally resolve all concurrent MVRegister candidates on a conflicted key."""
+        qkey = _qualify(key)
+        try:
+            parsed = json.loads(resolved_value)
+        except (ValueError, TypeError):
+            parsed = resolved_value
+        adapter.mv_resolve(qkey, parsed)
+        return json.dumps({"status": "resolved", "key": qkey, "value": adapter.read(qkey)})
+
     raw_fns = [
         (
             conflux_get_state,
-            "Read a shared key (counter, register, or set) from the Conflux CRDT state backend.",
+            "Read a shared key (counter, register, MVRegister, or set) from the Conflux CRDT state backend.",
         ),
         (
             conflux_set_register,
@@ -310,6 +345,18 @@ def create_autogen_tools(backend: Any, *, namespace: str = "team.") -> list[Any]
         (
             conflux_snapshot,
             "Inspect all shared Conflux state keys and the canonical SHA-256 state hash.",
+        ),
+        (
+            conflux_mv_write,
+            "Write a JSON or string value to a conflict-preserving Multi-Value Register (MVRegister).",
+        ),
+        (
+            conflux_conflicts,
+            "Inspect active concurrent multi-agent write conflicts in shared Conflux state.",
+        ),
+        (
+            conflux_resolve_conflict,
+            "Causally supersede all concurrent candidate versions on a conflicted MVRegister key.",
         ),
     ]
 

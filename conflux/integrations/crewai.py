@@ -135,15 +135,15 @@ class ConfluxCrewStorage:
                 "categories": list(rec.get("categories") or []),
                 "metadata": dict(rec.get("metadata") or {}),
                 "importance": float(rec.get("importance", 0.5)),
-                "created_at": created.isoformat() if isinstance(created, datetime) else (created or datetime.utcnow().isoformat()),
-                "last_accessed": accessed.isoformat() if isinstance(accessed, datetime) else (accessed or datetime.utcnow().isoformat()),
+                "created_at": created.isoformat() if isinstance(created, datetime) else (created or datetime.now(timezone.utc).isoformat()),
+                "last_accessed": accessed.isoformat() if isinstance(accessed, datetime) else (accessed or datetime.now(timezone.utc).isoformat()),
                 "embedding": list(rec["embedding"]) if rec.get("embedding") is not None else None,
                 "source": rec.get("source"),
                 "private": bool(rec.get("private", False)),
                 "deleted": False,
             }
-        created = getattr(rec, "created_at", None) or datetime.utcnow()
-        accessed = getattr(rec, "last_accessed", None) or datetime.utcnow()
+        created = getattr(rec, "created_at", None) or datetime.now(timezone.utc)
+        accessed = getattr(rec, "last_accessed", None) or datetime.now(timezone.utc)
         emb = getattr(rec, "embedding", None)
         return {
             "id": str(getattr(rec, "id", None) or uuid4()),
@@ -531,10 +531,37 @@ def create_crewai_tools(backend: Any, *, namespace: str = "crew.") -> list[Any]:
         members = sorted(str(x) for x in adapter.read_set(qkey))
         return json.dumps({"status": "ok", "key": qkey, "members": members})
 
+    def mv_write(key: str, value: Any) -> str:
+        """Write to a conflict-preserving Multi-Value Register (MVRegister) so concurrent agent edits are preserved."""
+        qkey = _qualify(key)
+        adapter.mv_set(qkey, value)
+        cands = adapter.candidates(qkey)
+        return json.dumps(
+            {
+                "status": "ok",
+                "key": qkey,
+                "value": adapter.read(qkey),
+                "has_conflict": len(cands) > 1,
+                "candidates": cands,
+            }
+        )
+
+    def list_conflicts(prefix: str = "") -> str:
+        """List all unresolved concurrent MVRegister conflicts across the Crew's shared state."""
+        search_prefix = _qualify(prefix) if prefix else (ns or None)
+        conflicts = adapter.conflicts(prefix=search_prefix)
+        return json.dumps({"conflict_count": len(conflicts), "conflicts": conflicts})
+
+    def resolve_conflict(key: str, resolved_value: Any) -> str:
+        """Resolve all concurrent candidate versions on a conflicted MVRegister key."""
+        qkey = _qualify(key)
+        adapter.mv_resolve(qkey, resolved_value)
+        return json.dumps({"status": "resolved", "key": qkey, "value": adapter.read(qkey)})
+
     specs = [
         (
             "conflux_read_state",
-            "Read a shared key (counter, LWW register, or ORSet) from the Conflux CRDT mesh.",
+            "Read a shared key (counter, LWW register, MVRegister, or ORSet) from the Conflux CRDT mesh.",
             read_state,
         ),
         (
@@ -551,6 +578,21 @@ def create_crewai_tools(backend: Any, *, namespace: str = "crew.") -> list[Any]:
             "conflux_add_to_set",
             "Add a member to a conflict-free shared ORSet in Conflux.",
             add_to_set,
+        ),
+        (
+            "conflux_mv_write",
+            "Write a value to a conflict-preserving Multi-Value Register (MVRegister) so concurrent edits are never silently lost.",
+            mv_write,
+        ),
+        (
+            "conflux_list_conflicts",
+            "Inspect active concurrent multi-agent write conflicts in shared Conflux state.",
+            list_conflicts,
+        ),
+        (
+            "conflux_resolve_conflict",
+            "Causally resolve all concurrent MVRegister candidates on a conflicted key into a single merged value.",
+            resolve_conflict,
         ),
     ]
 

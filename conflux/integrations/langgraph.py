@@ -142,6 +142,27 @@ def _unsafe_segment(text: str) -> str:
     )
 
 
+def _bounded_key(key: str, max_len: int = 250) -> str:
+    """Ensure dynamically generated adapter keys never exceed MAX_KEY_LENGTH (256)."""
+    if len(key) <= max_len:
+        return key
+    import hashlib
+
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    head = key[: max_len - 26]
+    return f"{head}~{digest}"
+
+
+def _bounded_tag(tag: str, max_len: int = 500) -> str:
+    """Ensure ORSet tags satisfy _check_tag (max 512 chars, no control chars)."""
+    if len(tag) <= max_len:
+        return tag
+    import hashlib
+
+    digest = hashlib.sha256(tag.encode("utf-8")).hexdigest()[:24]
+    return f"{tag[: max_len - 25]}:{digest}"
+
+
 class ConfluxCheckpointSaver(BaseCheckpointSaver):
     """LangGraph ``BaseCheckpointSaver`` backed by Conflux's deterministic CRDT fabric.
 
@@ -159,19 +180,19 @@ class ConfluxCheckpointSaver(BaseCheckpointSaver):
         self.prefix = prefix if prefix.endswith("/") else f"{prefix}/"
 
     def _threads_key(self) -> str:
-        return f"{self.prefix}threads"
+        return _bounded_key(f"{self.prefix}threads")
 
     def _idx_key(self, thread_id: str, ns: str) -> str:
-        return f"{self.prefix}idx/{_safe_segment(thread_id)}/{_safe_segment(ns)}"
+        return _bounded_key(f"{self.prefix}idx/{_safe_segment(thread_id)}/{_safe_segment(ns)}")
 
     def _ckpt_key(self, thread_id: str, ns: str, ckpt_id: str) -> str:
-        return (
+        return _bounded_key(
             f"{self.prefix}ckpt/{_safe_segment(thread_id)}/"
             f"{_safe_segment(ns)}/{_safe_segment(ckpt_id)}"
         )
 
     def _writes_key(self, thread_id: str, ns: str, ckpt_id: str) -> str:
-        return (
+        return _bounded_key(
             f"{self.prefix}writes/{_safe_segment(thread_id)}/"
             f"{_safe_segment(ns)}/{_safe_segment(ckpt_id)}"
         )
@@ -218,11 +239,13 @@ class ConfluxCheckpointSaver(BaseCheckpointSaver):
 
         self.backend.register_set(self._ckpt_key(thread_id, checkpoint_ns, checkpoint_id), record)
         thread_pair = f"{_safe_segment(thread_id)}/{_safe_segment(checkpoint_ns)}"
-        self.backend.set_add(self._threads_key(), thread_pair, tag=f"th:{thread_pair}")
+        self.backend.set_add(self._threads_key(), thread_pair, tag=_bounded_tag(f"th:{thread_pair}"))
         self.backend.set_add(
             self._idx_key(thread_id, checkpoint_ns),
             checkpoint_id,
-            tag=f"ck:{_safe_segment(thread_id)}:{_safe_segment(checkpoint_ns)}:{_safe_segment(checkpoint_id)}",
+            tag=_bounded_tag(
+                f"ck:{_safe_segment(thread_id)}:{_safe_segment(checkpoint_ns)}:{_safe_segment(checkpoint_id)}"
+            ),
         )
 
         return {
@@ -261,7 +284,7 @@ class ConfluxCheckpointSaver(BaseCheckpointSaver):
                 "task_path": task_path,
             }
             serialized = json.dumps(entry, sort_keys=True)
-            tag = f"wr:{_safe_segment(checkpoint_id)}:{_safe_segment(task_id)}:{mapped_idx}"
+            tag = _bounded_tag(f"wr:{_safe_segment(checkpoint_id)}:{_safe_segment(task_id)}:{mapped_idx}")
             self.backend.set_add(writes_key, serialized, tag=tag)
 
     def _read_writes_raw(self, thread_id: str, ns: str, ckpt_id: str) -> list[dict[str, Any]]:
@@ -417,9 +440,11 @@ class ConfluxCheckpointSaver(BaseCheckpointSaver):
                 continue
             for ckpt_id in list(self.backend.read_set(self._idx_key(t_id, ns))):
                 self.backend.register_set(self._ckpt_key(t_id, ns, str(ckpt_id)), None)
-                tag = f"ck:{_safe_segment(t_id)}:{_safe_segment(ns)}:{_safe_segment(str(ckpt_id))}"
+                tag = _bounded_tag(
+                    f"ck:{_safe_segment(t_id)}:{_safe_segment(ns)}:{_safe_segment(str(ckpt_id))}"
+                )
                 self.backend.set_remove(self._idx_key(t_id, ns), tag)
-            self.backend.set_remove(self._threads_key(), f"th:{raw_pair}")
+            self.backend.set_remove(self._threads_key(), _bounded_tag(f"th:{raw_pair}"))
 
     # ------------------------------------------------------------------
     # Async wrappers
@@ -484,36 +509,66 @@ class ConfluxStore(BaseStore):
 
     def _item_key(self, namespace: tuple[str, ...], key: str) -> str:
         ns_part = self._ns_str(namespace)
-        return f"{self.prefix}item/{ns_part}:{_safe_segment(key)}"
+        return _bounded_key(f"{self.prefix}item/{ns_part}:{_safe_segment(key)}")
 
     def _index_key(self) -> str:
-        return f"{self.prefix}index"
+        return _bounded_key(f"{self.prefix}index")
 
     # ------------------------------------------------------------------
     # Direct CRDT helpers for LangGraph nodes
     # ------------------------------------------------------------------
     def counter_inc(self, namespace: tuple[str, ...], key: str, by: int = 1) -> int:
-        full_key = f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}"
+        full_key = _bounded_key(f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}")
         self.backend.counter_inc(full_key, by=by)
         return int(self.backend.read(full_key) or 0)
 
     def counter_dec(self, namespace: tuple[str, ...], key: str, by: int = 1) -> int:
-        full_key = f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}"
+        full_key = _bounded_key(f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}")
         self.backend.counter_dec(full_key, by=by)
         return int(self.backend.read(full_key) or 0)
 
     def counter_read(self, namespace: tuple[str, ...], key: str) -> int:
-        full_key = f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}"
+        full_key = _bounded_key(f"{self.prefix}cnt/{self._ns_str(namespace)}:{_safe_segment(key)}")
         return int(self.backend.read(full_key) or 0)
 
     def set_add(self, namespace: tuple[str, ...], key: str, value: Any, tag: str | None = None) -> frozenset:
-        full_key = f"{self.prefix}set/{self._ns_str(namespace)}:{_safe_segment(key)}"
+        full_key = _bounded_key(f"{self.prefix}set/{self._ns_str(namespace)}:{_safe_segment(key)}")
         self.backend.set_add(full_key, value, tag=tag)
         return self.backend.read_set(full_key)
 
     def set_members(self, namespace: tuple[str, ...], key: str) -> frozenset:
-        full_key = f"{self.prefix}set/{self._ns_str(namespace)}:{_safe_segment(key)}"
+        full_key = _bounded_key(f"{self.prefix}set/{self._ns_str(namespace)}:{_safe_segment(key)}")
         return self.backend.read_set(full_key)
+
+    def mv_put(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: Any,
+        supersedes: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Write a conflict-preserving Multi-Value Register entry under ``(namespace, key)``."""
+        full_key = _bounded_key(f"{self.prefix}mv/{self._ns_str(namespace)}:{_safe_segment(key)}")
+        self.backend.mv_set(full_key, value, supersedes=supersedes)
+        cands = self.backend.candidates(full_key)
+        return {
+            "key": full_key,
+            "value": self.backend.read(full_key),
+            "has_conflict": len(cands) > 1,
+            "candidates": cands,
+        }
+
+    def mv_conflicts(self, namespace_prefix: tuple[str, ...] = ()) -> dict[str, list[dict[str, Any]]]:
+        """Return active concurrent MVRegister conflicts under ``namespace_prefix``."""
+        ns_part = self._ns_str(namespace_prefix)
+        search_prefix = f"{self.prefix}mv/{ns_part}" if ns_part else f"{self.prefix}mv/"
+        return self.backend.conflicts(prefix=search_prefix)
+
+    def mv_resolve(self, namespace: tuple[str, ...], key: str, resolved_value: Any) -> Any:
+        """Causally resolve all concurrent MVRegister candidates under ``(namespace, key)``."""
+        full_key = _bounded_key(f"{self.prefix}mv/{self._ns_str(namespace)}:{_safe_segment(key)}")
+        self.backend.mv_resolve(full_key, resolved_value)
+        return self.backend.read(full_key)
 
     # ------------------------------------------------------------------
     # Internal single-op implementations
@@ -522,7 +577,7 @@ class ConfluxStore(BaseStore):
         namespace = tuple(namespace)
         item_key = self._item_key(namespace, key)
         idx_entry = f"{self._ns_str(namespace)}:{_safe_segment(key)}"
-        tag = f"st:{idx_entry}"
+        tag = _bounded_tag(f"st:{idx_entry}")
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if value is None:
