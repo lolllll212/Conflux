@@ -9,31 +9,69 @@ from .websocket import connect_websocket
 
 class Client:
     def __init__(self, host, port, agent_id="client", secret=None, signature_alg="hmac-sha256",
-                 transport="tcp", tls=None):
+                 transport="tcp", tls=None, auto_reconnect=True):
+        import threading
+        import time
+
+        self.host = host
+        self.port = port
         self.agent_id = agent_id
         self.secret = secret
         self.signature_alg = signature_alg
+        self.transport = transport
+        self._tls_config = normalize_tls(tls)
+        self.auto_reconnect = auto_reconnect
+        self._io_lock = threading.RLock()
+        self._tag_seq = 0
+        self._closed_explicitly = False
+        # Seed initial monotonic tick from epoch microseconds so restarted agents
+        # with the same agent_id never reuse old action_ids or lose LWW ordering!
         self.replica = Replica(agent_id)
-        tls_config = normalize_tls(tls)
-        if transport == "ws":
-            ws = connect_websocket(host, port, ssl_ctx=tls_config)
+        self.replica._tick = int(time.time() * 1_000_000)
+        self._connect()
+
+    def _connect(self):
+        if self.transport == "ws":
+            ws = connect_websocket(self.host, self.port, ssl_ctx=self._tls_config)
             self._send = ws.send_json
             self._recv = ws.recv_json
             self._close = ws.close
-        elif transport == "tcp":
-            sock = socket.create_connection((host, port), timeout=10)
-            if tls_config is not None:
-                sock = tls_config.client_wrap(sock, server_hostname=host)
+        elif self.transport == "tcp":
+            sock = socket.create_connection((self.host, self.port), timeout=10)
+            if self._tls_config is not None:
+                sock = self._tls_config.client_wrap(sock, server_hostname=self.host)
             self._send = lambda m: send_msg(sock, m)
             self._recv = lambda: recv_msg(sock)
             self._close = sock.close
         else:
-            raise ValueError(f"unknown transport {transport!r}")
+            raise ValueError(f"unknown transport {self.transport!r}")
         try:
             self._welcome()
         except Exception:
             self._close()
             raise
+
+    def _request(self, payload, *, retryable=True):
+        with self._io_lock:
+            try:
+                self._send(payload)
+                resp = self._recv_safe()
+                if resp is None:
+                    raise ConnectionError("connection closed by server")
+                return resp
+            except (ConnectionError, OSError) as exc:
+                if not retryable or not self.auto_reconnect or self._closed_explicitly:
+                    raise ConnectionError(str(exc)) from None
+                try:
+                    self._close()
+                except OSError:
+                    pass
+                self._connect()
+                self._send(payload)
+                resp = self._recv_safe()
+                if resp is None:
+                    raise ConnectionError("connection closed by server after reconnect")
+                return resp
 
     def _recv_safe(self):
         try:
@@ -85,7 +123,9 @@ class Client:
         return self._submit("orset_remove", key, {"tag": tag})
 
     def _next_tag(self):
-        return f"{self.agent_id}:{self.replica.timestamp() + 1}"
+        with self._io_lock:
+            self._tag_seq += 1
+            return f"{self.agent_id}:{self.replica.timestamp() + self._tag_seq}"
 
     def submit_batch(self, op_specs):
         """Submit multiple operations in a single atomic network round-trip.
@@ -94,19 +134,20 @@ class Client:
         """
         if not op_specs:
             return []
-        actions = [self.replica._emit(op, key, params) for op, key, params in op_specs]
-        if self.secret is not None:
-            payload = {"type": "submit",
-                       "actions": [sign_action(a, self.secret, self.signature_alg) for a in actions]}
-        else:
-            payload = {"type": "submit", "actions": [a.export() for a in actions]}
-        self._send(payload)
-        resp = self._recv_safe()
-        if not resp or resp.get("type") == "error":
-            raise ConnectionError(resp.get("reason", "submit rejected") if resp else "submit rejected")
-        if resp.get("type") != "ack":
-            raise ConnectionError("server did not acknowledge submit")
-        return actions
+        with self._io_lock:
+            actions = [self.replica._emit(op, key, params) for op, key, params in op_specs]
+            if self.secret is not None:
+                payload = {"type": "submit",
+                           "actions": [sign_action(a, self.secret, self.signature_alg) for a in actions]}
+            else:
+                payload = {"type": "submit", "actions": [a.export() for a in actions]}
+            # Actions are idempotent by action_id on the server, so retry on broken idle socket is safe
+            resp = self._request(payload, retryable=True)
+            if resp.get("type") == "error":
+                raise ConnectionError(resp.get("reason", "submit rejected"))
+            if resp.get("type") != "ack":
+                raise ConnectionError("server did not acknowledge submit")
+            return actions
 
     def batch(self):
         """Context manager to batch multiple mutations into a single network frame:
@@ -118,64 +159,59 @@ class Client:
         return _ClientBatch(self)
 
     def _submit(self, op, key, params):
-        action = self.replica._emit(op, key, params)
-        if self.secret is not None:
-            payload = {"type": "submit",
-                       "actions": [sign_action(action, self.secret, self.signature_alg)]}
-        else:
-            payload = {"type": "submit", "actions": [action.export()]}
-        self._send(payload)
-        resp = self._recv_safe()
-        if not resp or resp.get("type") == "error":
-            raise ConnectionError(resp.get("reason", "submit rejected") if resp else "submit rejected")
-        if resp.get("type") != "ack":
-            raise ConnectionError("server did not acknowledge submit")
-        return action
+        with self._io_lock:
+            action = self.replica._emit(op, key, params)
+            if self.secret is not None:
+                payload = {"type": "submit",
+                           "actions": [sign_action(action, self.secret, self.signature_alg)]}
+            else:
+                payload = {"type": "submit", "actions": [action.export()]}
+            resp = self._request(payload, retryable=True)
+            if resp.get("type") == "error":
+                raise ConnectionError(resp.get("reason", "submit rejected"))
+            if resp.get("type") != "ack":
+                raise ConnectionError("server did not acknowledge submit")
+            return action
 
     def read(self, key):
-        self._send({"type": "read", "key": key})
-        resp = self._recv_safe()
-        if not resp or resp.get("type") != "read_resp":
+        resp = self._request({"type": "read", "key": key})
+        if resp.get("type") != "read_resp":
             raise ConnectionError("failed to read")
         return resp.get("value")
 
     def read_all(self):
-        self._send({"type": "read_all"})
-        resp = self._recv_safe()
-        if not resp or resp.get("type") != "read_resp":
+        resp = self._request({"type": "read_all"})
+        if resp.get("type") != "read_resp":
             raise ConnectionError("failed to read_all")
         return resp.get("value")
 
     def conflicts(self, prefix=None):
-        self._send({"type": "conflicts", "prefix": prefix})
-        resp = self._recv_safe()
-        if not resp or resp.get("type") != "conflicts_resp":
+        resp = self._request({"type": "conflicts", "prefix": prefix})
+        if resp.get("type") != "conflicts_resp":
             raise ConnectionError("failed to read conflicts")
         return resp.get("value") or {}
 
     def candidates(self, key):
-        self._send({"type": "candidates", "key": key})
-        resp = self._recv_safe()
-        if not resp or resp.get("type") != "candidates_resp":
+        resp = self._request({"type": "candidates", "key": key})
+        if resp.get("type") != "candidates_resp":
             raise ConnectionError("failed to read candidates")
         return resp.get("value") or []
 
     def hash(self):
-        self._send({"type": "hash"})
-        resp = self._recv_safe()
-        if not resp or resp.get("type") != "hash_resp":
+        resp = self._request({"type": "hash"})
+        if resp.get("type") != "hash_resp":
             raise ConnectionError("failed to read hash")
         return resp.get("hash")
 
     def sync(self):
-        self._send({"type": "sync"})
-        msg = self._recv_safe()
-        if not msg or msg.get("type") != "journal":
+        msg = self._request({"type": "sync"})
+        if msg.get("type") != "journal":
             raise ConnectionError("failed to sync")
         actions = [Action.import_action(d) for d in msg.get("actions", [])]
         return self.replica.absorb(actions)
 
     def close(self):
+        self._closed_explicitly = True
         try:
             self._close()
         except OSError:
@@ -209,6 +245,21 @@ class _ClientBatch:
 
     def register_set_weighted(self, key, value, weight):
         self._specs.append(("lww_set", key, {"value": value, "weight": weight}))
+        return self
+
+    def mv_set(self, key, value, supersedes=None):
+        if supersedes is None:
+            cands = self._client.candidates(key)
+            supersedes = [c["dot"] for c in cands]
+        else:
+            supersedes = [str(s) for s in supersedes]
+        self._specs.append(("mv_set", key, {"value": value, "supersedes": supersedes}))
+        return self
+
+    def mv_resolve(self, key, resolved_value):
+        cands = self._client.candidates(key)
+        dots = [c["dot"] for c in cands]
+        self._specs.append(("mv_set", key, {"value": resolved_value, "supersedes": dots}))
         return self
 
     def set_add(self, key, value, tag=None):

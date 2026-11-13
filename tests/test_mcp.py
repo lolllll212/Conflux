@@ -195,6 +195,7 @@ def test_mcp_conflicts_leases_prompts_and_resources_over_cluster():
 
     claim_3 = mcp_b.call_tool("conflux_claim_resource", {"resource": "conflux/server.py"})
     assert claim_3["acquired"] is True
+    cluster.gossip_round()
 
     # 5. Resources & URI Templates (`conflux://state/snapshot`, `conflux://state/conflicts`, `conflux://key/{key}`)
     tmpl_resp = mcp_a.handle_message({"jsonrpc": "2.0", "id": 5, "method": "resources/templates/list"})

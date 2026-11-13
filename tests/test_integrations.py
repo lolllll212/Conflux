@@ -330,3 +330,98 @@ def test_framework_integration_demos_run_clean(script):
     )
     assert proc.returncode == 0, proc.stderr
     assert "demo passed:" in proc.stdout
+
+
+def test_real_session_hazards_thread_safety_batch_tags_and_large_checkpoints():
+    """Regression suite covering real-world multi-agent session failure modes:
+    1. Multi-threaded parallel Client I/O (LangGraph/CrewAI/AutoGen asyncio.to_thread).
+    2. Multiple set_add() + mv_set() inside a single Client.batch() without tag collision.
+    3. Restarted Client with identical agent_id overwriting prior LWW values cleanly.
+    4. Large LangGraph checkpoints (>100 KB) & deep (>256-char) subgraph namespaces over TCP.
+    5. Conflict-preserving MVRegister tools across LangGraph, CrewAI, and AutoGen adapters.
+    """
+    import concurrent.futures
+    from conflux import Client, Server
+    from conflux.integrations.autogen import create_autogen_tools
+    from conflux.integrations.crewai import create_crewai_tools
+
+    server = Server("session-hub", ("127.0.0.1", 0)).start()
+    port = server.node_address[1]
+    try:
+        # 1. Parallel threads hammering a single shared Client instance simultaneously
+        with Client("127.0.0.1", port, agent_id="parallel-agent") as shared_client:
+            def worker(idx: int):
+                shared_client.counter_inc("session.parallel_ops", 1)
+                shared_client.register_set(f"session.slot.{idx % 5}", {"worker": idx})
+                return shared_client.read("session.parallel_ops")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+                results = list(pool.map(worker, range(48)))
+            assert len(results) == 48
+            assert shared_client.read("session.parallel_ops") == 48
+
+            # 2. Multiple set_add() + mv_set() in one atomic batch must NOT collide tags
+            with shared_client.batch() as b:
+                b.set_add("session.artifacts", "plan.md")
+                b.set_add("session.artifacts", "schema.sql")
+                b.set_add("session.artifacts", "tests.py")
+                b.mv_set("session.spec", {"v": 1})
+            assert sorted(shared_client.read("session.artifacts")) == [
+                "plan.md",
+                "schema.sql",
+                "tests.py",
+            ]
+            assert shared_client.read("session.spec") == {"v": 1}
+
+            # Write initial status before simulating agent restart
+            shared_client.register_set("session.lifecycle", "phase-1-before-restart")
+
+        # 3. Restarted process reconnecting with the SAME agent_id must win LWW & generate fresh action_id
+        with Client("127.0.0.1", port, agent_id="parallel-agent") as restarted_client:
+            restarted_client.register_set("session.lifecycle", "phase-2-after-restart")
+            assert restarted_client.read("session.lifecycle") == "phase-2-after-restart"
+
+            # 4. Large LangGraph checkpoint (>120 KB) + deep nested subgraph namespace (>260 chars) over live TCP Client
+            saver = ConfluxCheckpointSaver(restarted_client)
+            deep_ns = "/".join(f"subgraph_stage_{i}_agent_executor_node" for i in range(10))
+            assert len(deep_ns) > 260
+            cfg = {"configurable": {"thread_id": "prod-session-thread-9999", "checkpoint_ns": deep_ns}}
+            big_messages = [{"role": "assistant", "content": "reasoning " * 1500} for _ in range(8)]
+            ckpt = {
+                "v": 1,
+                "id": "1ef99999-0001-6000-8000-000000000001",
+                "ts": "2026-11-13T12:00:00+00:00",
+                "channel_values": {"messages": big_messages, "step": 4},
+                "channel_versions": {"messages": "4", "step": "4"},
+                "versions_seen": {},
+                "pending_sends": [],
+            }
+            saved_cfg = saver.put(cfg, ckpt, {"source": "loop", "step": 4}, {"messages": "4", "step": "4"})
+            loaded = saver.get_tuple(saved_cfg)
+            assert loaded is not None
+            assert len(loaded.checkpoint["channel_values"]["messages"]) == 8
+
+            # 5. MVRegister conflict workflow across LangGraph Store, CrewAI tools, and AutoGen tools
+            store_a = ConfluxStore(restarted_client)
+            with Client("127.0.0.1", port, agent_id="peer-agent-b") as client_b:
+                # Concurrent MV writes (peer-agent-b supersedes=[], simulating offline/unsynced proposal)
+                store_a.mv_put(("arch", "rfcs"), "db_choice", {"engine": "postgres"})
+                client_b.mv_set("lg.store/mv/arch/rfcs:db_choice", {"engine": "sqlite-crdt"}, supersedes=[])
+                conflicts = store_a.mv_conflicts(("arch",))
+                assert len(conflicts) == 1
+                resolved = store_a.mv_resolve(("arch", "rfcs"), "db_choice", {"engine": "conflux+postgres"})
+                assert resolved == {"engine": "conflux+postgres"}
+                assert len(store_a.mv_conflicts(("arch",))) == 0
+
+                crew_tools = {t.name: t for t in create_crewai_tools(restarted_client, namespace="crew.")}
+                assert "conflux_mv_write" in crew_tools and "conflux_resolve_conflict" in crew_tools
+                crew_tools["conflux_mv_write"].run("plan", {"owner": "researcher"})
+
+                ag_tools = {
+                    (getattr(t, "name", None) or t.__name__): t
+                    for t in create_autogen_tools(client_b, namespace="ag.")
+                }
+                assert "conflux_mv_write" in ag_tools and "conflux_conflicts" in ag_tools
+    finally:
+        server.stop()
+

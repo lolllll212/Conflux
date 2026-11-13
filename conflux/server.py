@@ -269,6 +269,7 @@ class Server:
             threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
 
     def _handle_conn(self, conn):
+        # 10s handshake timeout to prevent hung half-open scanners
         conn.settimeout(10)
 
         def send(obj):
@@ -277,8 +278,16 @@ class Server:
         def recv():
             return recv_msg(conn)
 
+        def on_agent_ready():
+            # Agent sessions idle between LLM reasoning steps (often 15-120s);
+            # keep agent TCP connections alive across long tool-calling intervals.
+            try:
+                conn.settimeout(300)
+            except OSError:
+                pass
+
         try:
-            self._conn_loop(send, recv, conn.close)
+            self._conn_loop(send, recv, conn.close, on_agent_ready=on_agent_ready)
         except (ConnectionError, OSError, ValueError):
             pass
         finally:
@@ -288,12 +297,19 @@ class Server:
                 pass
 
     def _handle_ws_conn(self, ws):
+        def on_agent_ready():
+            try:
+                ws._sock.settimeout(300)
+            except (AttributeError, OSError):
+                pass
+
         try:
-            self._conn_loop(ws.send_json, lambda: ws.recv_json(), ws.close)
+            self._conn_loop(ws.send_json, lambda: ws.recv_json(), ws.close,
+                            on_agent_ready=on_agent_ready)
         except (ConnectionError, OSError, ValueError):
             pass
 
-    def _conn_loop(self, send, recv, close):
+    def _conn_loop(self, send, recv, close, on_agent_ready=None):
         hello = recv()
         if not hello:
             return
@@ -313,18 +329,25 @@ class Server:
             except (ConnectionError, OSError, ValueError):
                 self._drop_link(key)
                 return
-            self._receive_loop(recv, send, key)
+            self._receive_loop(recv, send, key, is_agent=False)
         else:
+            if on_agent_ready is not None:
+                on_agent_ready()
             send({"type": "welcome", "node_id": self.node_id,
                   "peers": self._peer_list(), "members": self._member_list()})
             if hello.get("members"):
                 self._member_see_all(hello["members"])
-            self._receive_loop(recv, send, None)
+            self._receive_loop(recv, send, None, is_agent=True)
 
-    def _receive_loop(self, recv, send, key):
+    def _receive_loop(self, recv, send, key, is_agent=False):
         while not self._stopped.is_set():
             try:
                 msg = recv()
+            except socket.timeout:
+                if is_agent:
+                    # Keep long-lived agent client connections open unless server stops
+                    continue
+                break
             except (ConnectionError, OSError, ValueError):
                 break
             if msg is None:
@@ -499,7 +522,12 @@ class Server:
             return
         with self.lock:
             actions = [a.export() for a in self.replica.journal]
-        self._enqueue(key, {"type": "journal", "actions": actions}, actions)
+        if not actions:
+            return
+        chunk_size = self.batch_size if self.batch_size > 0 else 500
+        for i in range(0, len(actions), chunk_size):
+            chunk = actions[i:i + chunk_size]
+            self._enqueue(key, {"type": "journal", "actions": chunk}, chunk)
 
     def _drop_link(self, key):
         with self.lock:
@@ -635,8 +663,8 @@ class Server:
                                and a.action_id not in info["queued"]]
                 if not pending:
                     continue
-                chunks = [pending[i:i + self.batch_size] for i in range(0, len(pending),
-                          self.batch_size)] if self.batch_size > 0 else [pending]
+                chunk_size = self.batch_size if self.batch_size > 0 else 500
+                chunks = [pending[i:i + chunk_size] for i in range(0, len(pending), chunk_size)]
                 for chunk in chunks:
                     self._enqueue(key, {"type": "journal", "actions": chunk}, chunk)
             except (KeyError, AttributeError):
