@@ -462,8 +462,10 @@ def test_five_technical_risks_lamport_clock_async_client_alias_and_compaction(tm
         srv._absorb([high_tick_action])
         assert srv.read("leader") == "old"
 
-        # Now a brand-new client connects (zero wall-clock reliance!) and writes sequentially
+        # Now a brand-new client connects (zero wall-clock reliance!), observes the key via read(),
+        # and causally supersedes it without depending on system clocks!
         with Client("127.0.0.1", port, agent_id="fresh-agent") as c:
+            assert c.read("leader") == "old"
             assert c.replica.timestamp() >= 5000
             c.register_set("leader", "new-causal-winner")
             assert c.read("leader") == "new-causal-winner"
