@@ -51,6 +51,7 @@ class Server:
         self.discovered = set()
         self.members = {}
         self._link_by_address = {}
+        self._agent_ticks = {}
 
         self.store = JournalStore(data_dir, snapshot_threshold, journal_secret) if data_dir else None
         if self.store:
@@ -58,9 +59,11 @@ class Server:
             if root is not None:
                 self.replica.state._map = root
                 self.replica._tick = max(self.replica._tick, root.max_tick())
+                self._recover_agent_ticks(root)
             for action in actions:
                 self.replica.apply(action)
                 self.replica.journal.append(action)
+                self._record_agent_tick(action.agent, action.tick)
 
     def start(self):
         self._started_at = time.time()
@@ -337,9 +340,10 @@ class Server:
         else:
             if on_agent_ready is not None:
                 on_agent_ready()
+            agent_name = hello.get("node_id")
             with self.lock:
-                server_tick = self.replica.timestamp()
-            send({"type": "welcome", "node_id": self.node_id, "tick": server_tick,
+                agent_tick = self._agent_ticks.get(agent_name, 0) if agent_name else 0
+            send({"type": "welcome", "node_id": self.node_id, "agent_tick": agent_tick,
                   "peers": self._peer_list(), "members": self._member_list()})
             if hello.get("members"):
                 self._member_see_all(hello["members"])
@@ -381,18 +385,18 @@ class Server:
             self._absorb(actions)
             with self.lock:
                 self._metrics["submitted"] += len(actions)
-                server_tick = self.replica.timestamp()
-            send({"type": "ack", "node_id": self.node_id, "accepted": len(actions), "tick": server_tick})
+            send({"type": "ack", "node_id": self.node_id, "accepted": len(actions)})
         elif msg.get("type") == "read":
             with self.lock:
-                val = to_wire(self.replica.read(msg["key"]))
-                server_tick = self.replica.timestamp()
-            send({"type": "read_resp", "key": msg["key"], "value": val, "tick": server_tick})
+                crdt = self.replica.state._map.get(msg["key"])
+                val = to_wire(crdt.read() if crdt is not None else None)
+                key_tick = self._key_max_tick(crdt)
+            send({"type": "read_resp", "key": msg["key"], "value": val, "key_tick": key_tick})
         elif msg.get("type") == "read_all":
             with self.lock:
                 val = to_wire(self.replica.state.view())
-                server_tick = self.replica.timestamp()
-            send({"type": "read_resp", "value": val, "tick": server_tick})
+                max_tick = self.replica.state._map.max_tick()
+            send({"type": "read_resp", "value": val, "key_tick": max_tick})
         elif msg.get("type") == "conflicts":
             send({"type": "conflicts_resp", "value": to_wire(self.conflicts(msg.get("prefix")))})
         elif msg.get("type") == "candidates":
@@ -439,11 +443,43 @@ class Server:
                 self.store.rotate(self.replica.state._map, replace_root=True)
             return before
 
+    def _record_agent_tick(self, agent: str, tick: int) -> None:
+        if agent and isinstance(tick, int) and tick > self._agent_ticks.get(agent, 0):
+            self._agent_ticks[agent] = tick
+
+    def _recover_agent_ticks(self, ormap) -> None:
+        from .crdts import LWWRegister, MVRegister, ORMap
+
+        for crdt in ormap.fields.values():
+            if isinstance(crdt, LWWRegister) and crdt.stamp is not None:
+                self._record_agent_tick(crdt.stamp.agent, crdt.stamp.tick)
+            elif isinstance(crdt, MVRegister):
+                for d in list(crdt.entries) + list(crdt.superseded):
+                    st = MVRegister.parse_dot(d)
+                    self._record_agent_tick(st.agent, st.tick)
+            elif isinstance(crdt, ORMap):
+                self._recover_agent_ticks(crdt)
+
+    @staticmethod
+    def _key_max_tick(crdt) -> int:
+        from .crdts import LWWRegister, MVRegister
+
+        if isinstance(crdt, LWWRegister) and crdt.stamp is not None:
+            return crdt.stamp.tick
+        if isinstance(crdt, MVRegister):
+            best = 0
+            for d in list(crdt.entries) + list(crdt.superseded):
+                best = max(best, MVRegister.parse_dot(d).tick)
+            return best
+        return 0
+
     def _absorb(self, actions):
         if not actions:
             return
         with self.lock:
             absorbed = self.replica.absorb(actions)
+            for action in absorbed:
+                self._record_agent_tick(action.agent, action.tick)
             if absorbed and self.store is not None:
                 rotate = False
                 for action in absorbed:

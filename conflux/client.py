@@ -56,9 +56,12 @@ class Client:
 
     def _sync_clock(self, resp):
         if isinstance(resp, dict):
-            remote_tick = resp.get("tick")
-            if isinstance(remote_tick, int) and remote_tick > self.replica._tick:
-                self.replica._tick = remote_tick
+            # Causal Lamport sync: advance past our own prior agent_tick on welcome,
+            # or past the exact observed key_tick when reading a key!
+            for field in ("agent_tick", "key_tick"):
+                remote_tick = resp.get(field)
+                if isinstance(remote_tick, int) and remote_tick > self.replica._tick:
+                    self.replica._tick = remote_tick
 
     def _request(self, payload, *, retryable=True):
         with self._io_lock:
