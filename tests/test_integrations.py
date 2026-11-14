@@ -426,3 +426,80 @@ def test_real_session_hazards_thread_safety_batch_tags_and_large_checkpoints():
     finally:
         server.stop()
 
+
+def test_five_technical_risks_lamport_clock_async_client_alias_and_compaction(tmp_path):
+    """Verifies the 5 technical audit pillars:
+    1. Pure Lamport clock sync (zero wall-clock / time.time() drift sensitivity).
+    2. Non-blocking asyncio methods on Client & BackendAdapter (`aread`, `acounter_inc`, `async with`).
+    3. Package alias (`import conflux_state`) + PEP 561 `py.typed` markers.
+    4. Strict JSON-only payload validation (arbitrary Python objects rejected).
+    5. Tombstone compaction (`Server.compact_state()`) & bounded memory journal on durable servers.
+    """
+    import conflux
+    import conflux_state
+    from conflux import Client, Server, validate_action, Action, ValidationError
+
+    # Risk 4: Package alias & PEP 561 py.typed markers
+    assert conflux_state.__version__ == conflux.__version__
+    assert conflux_state.Server is conflux.Server
+    assert os.path.exists(os.path.join(REPO_ROOT, "conflux", "py.typed"))
+    assert os.path.exists(os.path.join(REPO_ROOT, "conflux_state", "py.typed"))
+
+    # Risk 5a: Arbitrary non-JSON Python objects strictly rejected
+    with pytest.raises(ValidationError):
+        validate_action(
+            Action("act-a-1", "a", 1, "lww_set", "bad", {"value": object()})
+        )
+
+    # Risk 3: Pure Lamport logical clock sync — even if a client's local tick starts at 0
+    # and another node wrote at tick 5000, connecting & reading advances the causal clock!
+    data_dir = str(tmp_path / "durable")
+    srv = Server("lamport-hub", ("127.0.0.1", 0), data_dir=data_dir, snapshot_threshold=5).start()
+    port = srv.node_address[1]
+    try:
+        # Simulate an agent with a high logical tick (5000) writing first
+        high_tick_action = Action("act-fast-5000", "fast-clock-agent", 5000, "lww_set", "leader", {"value": "old"})
+        srv._absorb([high_tick_action])
+        assert srv.read("leader") == "old"
+
+        # Now a brand-new client connects (zero wall-clock reliance!) and writes sequentially
+        with Client("127.0.0.1", port, agent_id="fresh-agent") as c:
+            assert c.replica.timestamp() >= 5000
+            c.register_set("leader", "new-causal-winner")
+            assert c.read("leader") == "new-causal-winner"
+
+            # Add & remove ORSet tags, then run tombstone compaction
+            c.set_add("jobs", "j1", tag="t-j1")
+            c.set_add("jobs", "j2", tag="t-j2")
+            c.set_remove("jobs", "t-j1")
+            assert c.read("jobs") == ["j2"]
+            pruned = srv.compact_state()
+            assert pruned == 1
+            assert c.read("jobs") == ["j2"]
+
+        # Risk 2: Non-blocking asyncio Client & BackendAdapter (`async with`, `acounter_inc`, `aread`)
+        async def _async_workout():
+            async with Client("127.0.0.1", port, agent_id="async-fastapi") as ac:
+                await asyncio.gather(
+                    ac.acounter_inc("async.hits", 1),
+                    ac.acounter_inc("async.hits", 2),
+                    ac.aregister_set("async.status", "non-blocking"),
+                )
+                assert await ac.aread("async.hits") == 3
+                assert await ac.aread("async.status") == "non-blocking"
+
+        asyncio.run(_async_workout())
+    finally:
+        srv.stop()
+
+    # Restart durable server from compacted snapshot and verify Lamport clock + compacted state survive!
+    srv2 = Server("lamport-hub", ("127.0.0.1", 0), data_dir=data_dir).start()
+    try:
+        assert srv2.replica.timestamp() >= 5001
+        assert srv2.read("leader") == "new-causal-winner"
+        assert srv2.read("jobs") == frozenset({"j2"})
+        assert len(srv2.replica.state._map.get("jobs").tombstones) == 0
+    finally:
+        srv2.stop()
+
+

@@ -330,6 +330,32 @@ class ORMap(Lattice):
         value = self.fields.get(key)
         return value.read() if value is not None else None
 
+    def max_tick(self) -> int:
+        best = 0
+        for crdt in self.fields.values():
+            if isinstance(crdt, LWWRegister) and crdt.stamp is not None:
+                best = max(best, crdt.stamp.tick)
+            elif isinstance(crdt, MVRegister):
+                for d in crdt.entries:
+                    best = max(best, MVRegister.parse_dot(d).tick)
+                for d in crdt.superseded:
+                    best = max(best, MVRegister.parse_dot(d).tick)
+            elif isinstance(crdt, ORMap):
+                best = max(best, crdt.max_tick())
+        return best
+
+    def compact(self) -> "ORMap":
+        """Prune tombstoned ORSet tags across all fields in the state map."""
+        compacted = {}
+        for k, crdt in self.fields.items():
+            if isinstance(crdt, ORSet):
+                compacted[k] = crdt.compact()
+            elif isinstance(crdt, ORMap):
+                compacted[k] = crdt.compact()
+            else:
+                compacted[k] = crdt
+        return ORMap(compacted)
+
     def canonical(self):
         rows = [[k, type(c).__name__, c.canonical()] for k, c in self.fields.items()]
         rows.sort(key=repr)

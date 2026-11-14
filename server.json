@@ -3,7 +3,7 @@
   "name": "io.github.lolllll212/conflux-state",
   "title": "Conflux CRDT Shared State",
   "description": "Zero-dependency CRDT shared state and conflict-resolution MCP server for parallel AI agents.",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "repository": {
     "url": "https://github.com/lolllll212/Conflux",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "conflux-state",
-      "version": "0.9.2",
+      "version": "0.9.3",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

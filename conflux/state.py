@@ -144,6 +144,9 @@ class Replica:
         if action.action_id in self._applied:
             return
         self._applied.add(action.action_id)
+        # True Lamport Logical Clock rule: L := max(L, action.tick) + 1 on receive
+        if isinstance(action.tick, int) and action.tick > self._tick:
+            self._tick = action.tick
         contribution = action.contribution()
         if contribution is not None:
             self.state.put(action.key, contribution)

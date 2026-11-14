@@ -52,7 +52,7 @@ When 10–30 autonomous agents collaborate on one codebase, research workflow, o
 
 ## 📦 Installation
 
-Install the **zero-dependency** core protocol + `conflux-server` + `conflux-mcp` CLI from PyPI (imported in Python as `conflux`):
+Install the **zero-dependency** core protocol + `conflux-server` + `conflux-mcp` CLI from PyPI (both `import conflux` and `import conflux_state` work out of the box, with full `py.typed` static type hints):
 
 ```bash
 pip install conflux-state
@@ -73,6 +73,7 @@ pip install "conflux-state[integrations]"  # All framework adapters
 ## 🚀 60-Second Quickstart
 
 ```python
+# Canonical import is `conflux` (`import conflux_state` is also supported as an alias)
 from conflux import Cluster, InMemoryTransport, state_hash
 
 # 3 autonomous agents writing concurrently with ZERO locks or coordinator

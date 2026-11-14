@@ -18,11 +18,13 @@ from .websocket import WebSocketServer, connect_websocket
 class Server:
     def __init__(self, node_id, address, peers=(), data_dir=None, gossip_interval=1.0,
                  snapshot_threshold=1000, registry=None, transport="tcp", batch_size=0,
-                 auto_discover=False, tls=None, journal_secret=None, stale_after=None):
+                 auto_discover=False, tls=None, journal_secret=None, stale_after=None,
+                 max_memory_journal=50_000):
         self.node_id = node_id
         self.address = tuple(address)
         self.peers = [tuple(p) for p in peers]
         self.gossip_interval = gossip_interval
+        self.max_memory_journal = int(max_memory_journal)
         self.node_address = None
         self.registry = registry
         self.transport = transport
@@ -55,8 +57,10 @@ class Server:
             root, actions = self.store.load()
             if root is not None:
                 self.replica.state._map = root
+                self.replica._tick = max(self.replica._tick, root.max_tick())
             for action in actions:
                 self.replica.apply(action)
+                self.replica.journal.append(action)
 
     def start(self):
         self._started_at = time.time()
@@ -333,7 +337,9 @@ class Server:
         else:
             if on_agent_ready is not None:
                 on_agent_ready()
-            send({"type": "welcome", "node_id": self.node_id,
+            with self.lock:
+                server_tick = self.replica.timestamp()
+            send({"type": "welcome", "node_id": self.node_id, "tick": server_tick,
                   "peers": self._peer_list(), "members": self._member_list()})
             if hello.get("members"):
                 self._member_see_all(hello["members"])
@@ -375,11 +381,18 @@ class Server:
             self._absorb(actions)
             with self.lock:
                 self._metrics["submitted"] += len(actions)
-            send({"type": "ack", "node_id": self.node_id, "accepted": len(actions)})
+                server_tick = self.replica.timestamp()
+            send({"type": "ack", "node_id": self.node_id, "accepted": len(actions), "tick": server_tick})
         elif msg.get("type") == "read":
-            send({"type": "read_resp", "key": msg["key"], "value": to_wire(self.read(msg["key"]))})
+            with self.lock:
+                val = to_wire(self.replica.read(msg["key"]))
+                server_tick = self.replica.timestamp()
+            send({"type": "read_resp", "key": msg["key"], "value": val, "tick": server_tick})
         elif msg.get("type") == "read_all":
-            send({"type": "read_resp", "value": to_wire(self.view())})
+            with self.lock:
+                val = to_wire(self.replica.state.view())
+                server_tick = self.replica.timestamp()
+            send({"type": "read_resp", "value": val, "tick": server_tick})
         elif msg.get("type") == "conflicts":
             send({"type": "conflicts_resp", "value": to_wire(self.conflicts(msg.get("prefix")))})
         elif msg.get("type") == "candidates":
@@ -407,6 +420,25 @@ class Server:
             elif msg.get("what") == "prometheus":
                 send({"type": "prometheus", "body": self.prometheus()})
 
+    def compact_state(self) -> int:
+        """Prune tombstoned ORSet tags across local state (and rotate snapshot if durable).
+
+        Call at quiescent checkpoints once cluster peers have converged. Returns
+        the number of tombstones removed across all ORSet fields.
+        """
+        from .crdts import ORSet
+
+        with self.lock:
+            before = sum(
+                len(c.tombstones)
+                for c in self.replica.state._map.fields.values()
+                if isinstance(c, ORSet)
+            )
+            self.replica.state._map = self.replica.state._map.compact()
+            if self.store is not None and before > 0:
+                self.store.rotate(self.replica.state._map, replace_root=True)
+            return before
+
     def _absorb(self, actions):
         if not actions:
             return
@@ -418,6 +450,12 @@ class Server:
                     rotate = self.store.append(action) or rotate
                 if rotate:
                     self.store.rotate(self.replica.state._map)
+                    # Bound in-memory journal & applied-ID cache on long-lived servers
+                    if len(self.replica.journal) > self.max_memory_journal:
+                        keep = self.max_memory_journal // 2
+                        self.replica.journal = self.replica.journal[-keep:]
+                        if len(self.replica._applied) > self.max_memory_journal * 2:
+                            self.replica._applied = {a.action_id for a in self.replica.journal}
 
     def _send_journal(self, send):
         with self.lock:

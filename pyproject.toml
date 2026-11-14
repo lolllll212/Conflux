@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conflux-state"
-version = "0.9.2"
+version = "0.9.3"
 description = "Deterministic, conflict-aware CRDT shared state protocol for concurrent AI agents, with MCP server and drop-in adapters for LangGraph, CrewAI, and AutoGen."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -65,7 +65,11 @@ integrations = [
 test = ["pytest", "cryptography>=3.4"]
 
 [tool.setuptools]
-packages = ["conflux", "conflux.integrations"]
+packages = ["conflux", "conflux.integrations", "conflux_state"]
+
+[tool.setuptools.package-data]
+conflux = ["py.typed"]
+conflux_state = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
