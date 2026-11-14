@@ -42,11 +42,17 @@ When 10–30 autonomous agents collaborate on one codebase, research workflow, o
 | **Hard Crash (`kill -9`) & Partitions** | Corrupted state | Needs WAL / cluster ops | **Fsynced HMAC-signed journals + cumulative snapshots + auto-heal** |
 | **Core Runtime Dependencies** | — | External DB / drivers | **Zero (100% Python stdlib TCP, RFC6455 WebSocket, TLS, Prometheus)** |
 
+<p align="center">
+  <img src="docs/assets/benchmark-powershell.png" alt="Conflux Multi-Agent Concurrency Benchmark: 87.5% silent data loss in naive LWW vs 0% loss and 0 SQLite lock errors in Conflux" width="900" />
+  <br />
+  <sub><em>Reproduce on your machine in 1 second (zero external dependencies): <code>python examples/silent_overwrite_benchmark.py</code></em></sub>
+</p>
+
 ---
 
 ## 📦 Installation
 
-Install the **zero-dependency** core protocol + `conflux-server` + `conflux-mcp` CLI from PyPI (imported in Python as `conflux`):
+Install the **zero-dependency** core protocol + `conflux-server` + `conflux-mcp` CLI from PyPI (both `import conflux` and `import conflux_state` work out of the box, with full `py.typed` static type hints):
 
 ```bash
 pip install conflux-state
@@ -67,6 +73,7 @@ pip install "conflux-state[integrations]"  # All framework adapters
 ## 🚀 60-Second Quickstart
 
 ```python
+# Canonical import is `conflux` (`import conflux_state` is also supported as an alias)
 from conflux import Cluster, InMemoryTransport, state_hash
 
 # 3 autonomous agents writing concurrently with ZERO locks or coordinator
@@ -307,11 +314,12 @@ Full formal protocol bounds and security review:
 ## 🧪 Running the Test Suite & Demos
 
 ```bash
-python -m pytest                              # 123 conformance, security, integration & MCP tests
-python examples/agent_crew_demo.py            # 6 signed agents + crash + torn journal + auto-heal
-python examples/langgraph_shared_state.py     # Cross-node StateGraph pause & resume
-python examples/crewai_shared_memory.py       # Signed 2-node TCP CrewAI memory & flow persistence
-python examples/autogen_shared_state.py       # AutoGen context injection & CRDT tools
+python -m pytest                                  # 126 conformance, security, integration & MCP tests
+python examples/silent_overwrite_benchmark.py     # 8-agent concurrency benchmark (LWW & SQLite vs CRDTs)
+python examples/agent_crew_demo.py                # 6 signed agents + crash + torn journal + auto-heal
+python examples/langgraph_shared_state.py         # Cross-node StateGraph pause & resume
+python examples/crewai_shared_memory.py           # Signed 2-node TCP CrewAI memory & flow persistence
+python examples/autogen_shared_state.py           # AutoGen context injection & CRDT tools
 ```
 
 ---

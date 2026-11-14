@@ -24,10 +24,13 @@ class Client:
         self._io_lock = threading.RLock()
         self._tag_seq = 0
         self._closed_explicitly = False
-        # Seed initial monotonic tick from epoch microseconds so restarted agents
-        # with the same agent_id never reuse old action_ids or lose LWW ordering!
+        # Pure logical Lamport clock (zero wall-clock / NTP drift dependence!).
+        # _welcome() immediately advances _tick >= server_tick via Hybrid/Lamport sync,
+        # and each restarted session adds a monotonic session nonce for unique action_ids.
+        import os
+
         self.replica = Replica(agent_id)
-        self.replica._tick = int(time.time() * 1_000_000)
+        self._session_nonce = os.urandom(3).hex()
         self._connect()
 
     def _connect(self):
@@ -51,6 +54,12 @@ class Client:
             self._close()
             raise
 
+    def _sync_clock(self, resp):
+        if isinstance(resp, dict):
+            remote_tick = resp.get("tick")
+            if isinstance(remote_tick, int) and remote_tick > self.replica._tick:
+                self.replica._tick = remote_tick
+
     def _request(self, payload, *, retryable=True):
         with self._io_lock:
             try:
@@ -58,6 +67,7 @@ class Client:
                 resp = self._recv_safe()
                 if resp is None:
                     raise ConnectionError("connection closed by server")
+                self._sync_clock(resp)
                 return resp
             except (ConnectionError, OSError) as exc:
                 if not retryable or not self.auto_reconnect or self._closed_explicitly:
@@ -71,6 +81,7 @@ class Client:
                 resp = self._recv_safe()
                 if resp is None:
                     raise ConnectionError("connection closed by server after reconnect")
+                self._sync_clock(resp)
                 return resp
 
     def _recv_safe(self):
@@ -85,6 +96,7 @@ class Client:
         if not resp or resp.get("type") != "welcome":
             raise ConnectionError("server did not accept connection")
         self.server_id = resp.get("node_id")
+        self._sync_clock(resp)
 
     def counter_inc(self, key, by=1):
         return self._submit("counter_inc", key, {"by": by})
@@ -122,10 +134,23 @@ class Client:
     def set_remove(self, key, tag):
         return self._submit("orset_remove", key, {"tag": tag})
 
+    def _emit_session_action(self, op, key, params):
+        raw = self.replica._emit(op, key, params)
+        # Include session nonce in action_id so even if two offline clients share an agent_id,
+        # their action_ids never collide on server absorb!
+        return Action(
+            action_id=f"act-{self.agent_id}-{self._session_nonce}-{raw.tick}",
+            agent=raw.agent,
+            tick=raw.tick,
+            op=raw.op,
+            key=raw.key,
+            params=raw.params,
+        )
+
     def _next_tag(self):
         with self._io_lock:
             self._tag_seq += 1
-            return f"{self.agent_id}:{self.replica.timestamp() + self._tag_seq}"
+            return f"{self.agent_id}:{self._session_nonce}:{self.replica.timestamp() + self._tag_seq}"
 
     def submit_batch(self, op_specs):
         """Submit multiple operations in a single atomic network round-trip.
@@ -135,7 +160,7 @@ class Client:
         if not op_specs:
             return []
         with self._io_lock:
-            actions = [self.replica._emit(op, key, params) for op, key, params in op_specs]
+            actions = [self._emit_session_action(op, key, params) for op, key, params in op_specs]
             if self.secret is not None:
                 payload = {"type": "submit",
                            "actions": [sign_action(a, self.secret, self.signature_alg) for a in actions]}
@@ -160,7 +185,7 @@ class Client:
 
     def _submit(self, op, key, params):
         with self._io_lock:
-            action = self.replica._emit(op, key, params)
+            action = self._emit_session_action(op, key, params)
             if self.secret is not None:
                 payload = {"type": "submit",
                            "actions": [sign_action(action, self.secret, self.signature_alg)]}
@@ -217,11 +242,78 @@ class Client:
         except OSError:
             pass
 
+    # ------------------------------------------------------------------
+    # Non-blocking asyncio helpers (FastAPI / async agent orchestrators)
+    # ------------------------------------------------------------------
+    async def acounter_inc(self, key, by=1):
+        import asyncio
+
+        return await asyncio.to_thread(self.counter_inc, key, by)
+
+    async def acounter_dec(self, key, by=1):
+        import asyncio
+
+        return await asyncio.to_thread(self.counter_dec, key, by)
+
+    async def aregister_set(self, key, value):
+        import asyncio
+
+        return await asyncio.to_thread(self.register_set, key, value)
+
+    async def amv_set(self, key, value, supersedes=None):
+        import asyncio
+
+        return await asyncio.to_thread(self.mv_set, key, value, supersedes)
+
+    async def amv_resolve(self, key, resolved_value):
+        import asyncio
+
+        return await asyncio.to_thread(self.mv_resolve, key, resolved_value)
+
+    async def aset_add(self, key, value, tag=None):
+        import asyncio
+
+        return await asyncio.to_thread(self.set_add, key, value, tag)
+
+    async def aset_remove(self, key, tag):
+        import asyncio
+
+        return await asyncio.to_thread(self.set_remove, key, tag)
+
+    async def aread(self, key):
+        import asyncio
+
+        return await asyncio.to_thread(self.read, key)
+
+    async def aread_all(self):
+        import asyncio
+
+        return await asyncio.to_thread(self.read_all)
+
+    async def aconflicts(self, prefix=None):
+        import asyncio
+
+        return await asyncio.to_thread(self.conflicts, prefix)
+
+    async def ahash(self):
+        import asyncio
+
+        return await asyncio.to_thread(self.hash)
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        import asyncio
+
+        await asyncio.to_thread(self.close)
         return False
 
 

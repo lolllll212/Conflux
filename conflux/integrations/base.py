@@ -169,6 +169,66 @@ class BackendAdapter:
                 return state_hash(self.target.replica.state)
             return state_hash(self.target.state)
 
+    # ------------------------------------------------------------------
+    # Non-blocking asyncio facade (FastAPI / async agent event loops)
+    # ------------------------------------------------------------------
+    async def acounter_inc(self, key: str, by: int = 1):
+        import asyncio
+
+        return await asyncio.to_thread(self.counter_inc, key, by)
+
+    async def acounter_dec(self, key: str, by: int = 1):
+        import asyncio
+
+        return await asyncio.to_thread(self.counter_dec, key, by)
+
+    async def aregister_set(self, key: str, value: Any):
+        import asyncio
+
+        return await asyncio.to_thread(self.register_set, key, value)
+
+    async def amv_set(
+        self, key: str, value: Any, supersedes: list[str] | tuple[str, ...] | None = None
+    ):
+        import asyncio
+
+        return await asyncio.to_thread(self.mv_set, key, value, supersedes)
+
+    async def amv_resolve(self, key: str, resolved_value: Any):
+        import asyncio
+
+        return await asyncio.to_thread(self.mv_resolve, key, resolved_value)
+
+    async def aset_add(self, key: str, value: Any, tag: str | None = None):
+        import asyncio
+
+        return await asyncio.to_thread(self.set_add, key, value, tag)
+
+    async def aset_remove(self, key: str, tag: str):
+        import asyncio
+
+        return await asyncio.to_thread(self.set_remove, key, tag)
+
+    async def aread(self, key: str) -> Any:
+        import asyncio
+
+        return await asyncio.to_thread(self.read, key)
+
+    async def aview(self, prefix: str | None = None) -> dict[str, Any]:
+        import asyncio
+
+        return await asyncio.to_thread(self.view, prefix)
+
+    async def aconflicts(self, prefix: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        import asyncio
+
+        return await asyncio.to_thread(self.conflicts, prefix)
+
+    async def ahash(self) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(self.hash)
+
 
 def coerce_backend(target: BackendAdapter | Replica | Server | DistributedApp | Client) -> BackendAdapter:
     if isinstance(target, BackendAdapter):

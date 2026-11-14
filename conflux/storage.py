@@ -97,8 +97,8 @@ class JournalStore:
         self._since_snapshot += 1
         return self._since_snapshot >= self.threshold
 
-    def rotate(self, root_ormap):
-        cumulative = self._cumulative_root(root_ormap)
+    def rotate(self, root_ormap, replace_root=False):
+        cumulative = root_ormap if replace_root else self._cumulative_root(root_ormap)
         payload = {"seq": self._seq, "root": cumulative.to_dict()}
         if self.journal_secret is not None:
             payload["sig"] = self._sign({"seq": payload["seq"], "root": payload["root"]})
